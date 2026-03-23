@@ -442,176 +442,228 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
 
-    # Если запрошено удалённое выполнение - отправляем задачу на агент
-    if args.execute_remotely:
-        print(f"\n{'=' * 60}")
-        print("Удалённое выполнение через ClearML Agent")
-        print(f"{'=' * 60}")
-        print(f"Очередь: {args.queue}")
-        print(f"Проект: {args.project_name}")
-        print(f"{'=' * 60}\n")
+args = parse_args()
 
-        # Создаём задачу для удалённого выполнения
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        task_name = args.task_name or f"pytorch_dataset_remote_{timestamp}"
+# Проверяем наличие CUDA для правильной установки torch (только для удалённого выполнения)
+# ВАЖНО: ignore_requirements/add_requirements должны вызываться ДО Task.init()
+if args.execute_remotely:
+    import torch
+    cuda_available = torch.cuda.is_available()
+    print(f"\n{'=' * 60}")
+    print("Удалённое выполнение через ClearML Agent")
+    print(f"{'=' * 60}")
+    print(f"CUDA доступен: {cuda_available}")
 
-        task = Task.init(
-            project_name=args.project_name,
-            task_name=task_name,
-            task_type=Task.TaskTypes.data_processing,
-            reuse_last_task_id=False,
-        )
+    # Если CUDA нет - игнорируем platform-specific зависимости из uv.lock
+    # и устанавливаем CPU-версию torch
+    if not cuda_available:
+        print("CUDA не доступен, используем CPU-версию torch")
+        Task.ignore_requirements("torch")
+        Task.ignore_requirements("torchvision")
+        Task.ignore_requirements("torchaudio")
+        Task.add_requirements("torch", ">=2.0.0")
+        Task.add_requirements("torchvision", ">=0.15.0")
+    else:
+        print("CUDA доступен, используем GPU-версию torch")
+    print(f"{'=' * 60}\n")
 
-        # Подключение конфигурации
-        config = {
-            "dataset_id": args.dataset_id,
-            "image_size": args.image_size,
-            "norm_range": args.norm_range,
-            "batch_size": args.batch_size,
-            "train_split": args.train_split,
-            "num_workers": args.num_workers,
-            "save_state": args.save_state,
-            "state_dir": args.state_dir,
+# Инициализация Task (единая для локального и удалённого выполнения)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+task_name = args.task_name or f"pytorch_dataset_{timestamp}"
+
+task = Task.init(
+    project_name=args.project_name,
+    task_name=task_name,
+    task_type=Task.TaskTypes.data_processing,
+    reuse_last_task_id=False,
+)
+
+# Подключение конфигурации
+config = {
+    "dataset_id": args.dataset_id,
+    "image_size": args.image_size,
+    "norm_range": args.norm_range,
+    "batch_size": args.batch_size,
+    "train_split": args.train_split,
+    "num_workers": args.num_workers,
+    "save_state": args.save_state,
+    "state_dir": args.state_dir,
+}
+task.connect_configuration(config)
+# Для удалённого выполнения - отправляем задачу в очередь сразу после init
+if args.execute_remotely:
+    # Отправляем задачу на выполнение в очередь
+    print(f"Отправка задачи в очередь '{args.queue}'...")
+
+    task.execute_remotely(
+        queue_name=args.queue,
+        clone=False,
+        exit_process=True,
+    )
+
+# Локальное выполнение (без --execute_remotely)
+
+# Создание DataLoaders
+print("\n" + "=" * 60)
+print("Создание DataLoaders")
+print("=" * 60)
+print(f"Dataset ID: {args.dataset_id}")
+print(f"Image Size: {args.image_size}")
+print(f"Norm Range: {args.norm_range}")
+print(f"Batch Size: {args.batch_size}")
+print(f"Train Split: {args.train_split}")
+print("=" * 60 + "\n")
+
+train_loader, test_loader = create_dataloaders(
+    dataset_id=args.dataset_id,
+    image_size=args.image_size,
+    norm_range=args.norm_range,
+    batch_size=args.batch_size,
+    train_split=args.train_split,
+    num_workers=args.num_workers,
+    save_state=args.save_state,
+    state_dir=args.state_dir,
+)
+
+# Проверка
+print("\nПроверка DataLoaders:")
+lq, hq = next(iter(train_loader))
+print(f"  Train batch LQ: {lq.shape}")
+print(f"  Train batch HQ: {hq.shape}")
+
+lq, hq = next(iter(test_loader))
+print(f"  Test batch LQ: {lq.shape}")
+print(f"  Test batch HQ: {hq.shape}")
+
+# Логирование статистики
+task.get_logger().report_scalar(
+    title="Dataset Stats",
+    series="train_size",
+    value=len(train_loader.dataset),
+    iteration=0
+)
+task.get_logger().report_scalar(
+    title="Dataset Stats",
+    series="test_size",
+    value=len(test_loader.dataset),
+    iteration=0
+)
+
+# Логирование примеров изображений для отладки (2-3 sample)
+print("\nЛогирование примеров изображений в ClearML...")
+logger = task.get_logger()
+
+# Берём 3 примера из train
+num_samples = min(3, len(train_loader.dataset))
+for idx in range(num_samples):
+    lq_sample, hq_sample = train_loader.dataset[idx]
+    
+    # Конвертация (C, H, W) -> (H, W, C) для отображения
+    lq_np = lq_sample.permute(1, 2, 0).cpu().numpy()
+    hq_np = hq_sample.permute(1, 2, 0).cpu().numpy()
+    
+    # Если нормализация в [-1, 1], конвертируем обратно в [0, 1] для отображения
+    if args.norm_range == "-1_1":
+        lq_np = (lq_np + 1.0) / 2.0
+        hq_np = (hq_np + 1.0) / 2.0
+    
+    # Ограничиваем значения в [0, 1]
+    lq_np = np.clip(lq_np, 0, 1)
+    hq_np = np.clip(hq_np, 0, 1)
+    
+    # Логирование LQ
+    logger.report_image(
+        title="Debug Samples - LQ (Low Quality)",
+        series=f"lq_sample_{idx}",
+        iteration=0,
+        image=lq_np
+    )
+
+    # Логирование HQ
+    logger.report_image(
+        title="Debug Samples - HQ (High Quality)",
+        series=f"hq_sample_{idx}",
+        iteration=0,
+        image=hq_np
+    )
+
+print(f"  Загружено {num_samples} примеров в ClearML logger")
+
+# Сохранение DataLoaders как артефактов ClearML
+print("\nСохранение DataLoaders как артефактов ClearML...")
+import tempfile
+import shutil
+
+# Создаём временную директорию для сохранения состояний
+with tempfile.TemporaryDirectory() as temp_dir:
+    temp_path = Path(temp_dir)
+    
+    # Сохраняем состояния DataLoaders
+    train_state_path = temp_path / "train_dataloader_state.pkl"
+    test_state_path = temp_path / "test_dataloader_state.pkl"
+    
+    # Сохраняем состояние train DataLoader
+    if train_loader.generator is not None:
+        save_dataloader_state(train_loader, str(train_state_path))
+    else:
+        # Если generator нет, сохраняем метаданные
+        train_metadata = {
+            'batch_size': train_loader.batch_size,
+            'num_workers': train_loader.num_workers,
+            'dataset_size': len(train_loader.dataset),
+            'num_batches': len(train_loader),
+            'shuffle': True
         }
-        task.connect_configuration(config)
+        with open(train_state_path, 'wb') as f:
+            pickle.dump(train_metadata, f)
+    print(f"  Состояние train DataLoader сохранено")
 
-        # Отправляем задачу на выполнение в очередь
-        print(f"Отправка задачи в очередь '{args.queue}'...")
-        task.execute_remotely(
-            queue_name=args.queue,
-            clone=False,
-            exit_process=True,
-        )
-        return None, None
-    
-    # Локальное выполнение
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    task_name = args.task_name or f"pytorch_dataset_{timestamp}"
-
-    task = Task.init(
-        project_name=args.project_name,
-        task_name=task_name,
-        task_type=Task.TaskTypes.data_processing,
-        reuse_last_task_id=False,
-    )
-
-    # Подключение конфигурации
-    config = {
-        "dataset_id": args.dataset_id,
-        "image_size": args.image_size,
-        "norm_range": args.norm_range,
-        "batch_size": args.batch_size,
-        "train_split": args.train_split,
-        "num_workers": args.num_workers,
-        "save_state": args.save_state,
-        "state_dir": args.state_dir,
+    # Сохраняем состояние test DataLoader
+    test_metadata = {
+        'batch_size': test_loader.batch_size,
+        'num_workers': test_loader.num_workers,
+        'dataset_size': len(test_loader.dataset),
+        'num_batches': len(test_loader),
+        'shuffle': False
     }
-    task.connect_configuration(config)
-
-    # Создание DataLoaders
-    print("\n" + "=" * 60)
-    print("Создание DataLoaders")
-    print("=" * 60)
-    print(f"Dataset ID: {args.dataset_id}")
-    print(f"Image Size: {args.image_size}")
-    print(f"Norm Range: {args.norm_range}")
-    print(f"Batch Size: {args.batch_size}")
-    print(f"Train Split: {args.train_split}")
-    print("=" * 60 + "\n")
-
-    train_loader, test_loader = create_dataloaders(
-        dataset_id=args.dataset_id,
-        image_size=args.image_size,
-        norm_range=args.norm_range,
-        batch_size=args.batch_size,
-        train_split=args.train_split,
-        num_workers=args.num_workers,
-        save_state=args.save_state,
-        state_dir=args.state_dir,
-    )
-
-    # Проверка
-    print("\nПроверка DataLoaders:")
-    lq, hq = next(iter(train_loader))
-    print(f"  Train batch LQ: {lq.shape}")
-    print(f"  Train batch HQ: {hq.shape}")
-
-    lq, hq = next(iter(test_loader))
-    print(f"  Test batch LQ: {lq.shape}")
-    print(f"  Test batch HQ: {hq.shape}")
-
-    # Логирование статистики
-    task.get_logger().report_scalar(
-        title="Dataset Stats",
-        series="train_size",
-        value=len(train_loader.dataset),
-        iteration=0
-    )
-    task.get_logger().report_scalar(
-        title="Dataset Stats",
-        series="test_size",
-        value=len(test_loader.dataset),
-        iteration=0
-    )
-
-    # Логирование примеров изображений для отладки (2-3 sample)
-    print("\nЛогирование примеров изображений в ClearML...")
-    logger = task.get_logger()
+    with open(test_state_path, 'wb') as f:
+        pickle.dump(test_metadata, f)
+    print(f"  Состояние test DataLoader сохранено")
     
-    # Берём 3 примера из train
-    num_samples = min(3, len(train_loader.dataset))
-    for idx in range(num_samples):
-        lq_sample, hq_sample = train_loader.dataset[idx]
-        
-        # Конвертация (C, H, W) -> (H, W, C) для отображения
-        lq_np = lq_sample.permute(1, 2, 0).cpu().numpy()
-        hq_np = hq_sample.permute(1, 2, 0).cpu().numpy()
-        
-        # Если нормализация в [-1, 1], конвертируем обратно в [0, 1] для отображения
-        if args.norm_range == "-1_1":
-            lq_np = (lq_np + 1.0) / 2.0
-            hq_np = (hq_np + 1.0) / 2.0
-        
-        # Ограничиваем значения в [0, 1]
-        lq_np = np.clip(lq_np, 0, 1)
-        hq_np = np.clip(hq_np, 0, 1)
-        
-        # Логирование LQ
-        logger.report_image(
-            title="Debug Samples - LQ (Low Quality)",
-            series=f"sample_{idx}",
-            iteration=0,
-            image=lq_np,
-            image_format="RGB"
-        )
-        
-        # Логирование HQ
-        logger.report_image(
-            title="Debug Samples - HQ (High Quality)",
-            series=f"sample_{idx}",
-            iteration=0,
-            image=hq_np,
-            image_format="RGB"
-        )
+    # Сохраняем метаданные датасета
+    dataset_metadata = {
+        'dataset_id': args.dataset_id,
+        'image_size': args.image_size,
+        'norm_range': args.norm_range,
+        'batch_size': args.batch_size,
+        'train_split': args.train_split,
+        'train_size': len(train_loader.dataset),
+        'test_size': len(test_loader.dataset),
+    }
+    metadata_path = temp_path / "dataset_metadata.json"
+    import json
+    with open(metadata_path, 'w') as f:
+        json.dump(dataset_metadata, f, indent=2)
+    print(f"  Метаданные датасета сохранены")
     
-    print(f"  Загружено {num_samples} примеров в ClearML logger")
+    # Загружаем артефакты в ClearML
+    task.upload_artifact(
+        name='dataloader_states',
+        artifact_object=str(temp_path),
+        delete_after_upload=False
+    )
 
-    print("\n" + "=" * 60)
-    print("ГОТОВО")
-    print("=" * 60)
-    print(f"Train DataLoader: {len(train_loader)} батчей")
-    print(f"Test DataLoader: {len(test_loader)} батчей")
+print(f"  DataLoaders сохранены как артефакт 'dataloader_states'")
 
-    if args.save_state:
-        print(f"Состояние сохранено в: {args.state_dir}")
+print("\n" + "=" * 60)
+print("ГОТОВО")
+print("=" * 60)
+print(f"Train DataLoader: {len(train_loader)} батчей")
+print(f"Test DataLoader: {len(test_loader)} батчей")
 
-    task.close()
+if args.save_state:
+    print(f"Состояние сохранено в: {args.state_dir}")
 
-    return train_loader, test_loader
+task.close()
 
-
-if __name__ == "__main__":
-    main()
