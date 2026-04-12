@@ -270,22 +270,29 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def prepare_remote_environment(execute_remotely: bool) -> None:
+def prepare_remote_environment(execute_remotely: bool, device_arg: str) -> None:
     if not execute_remotely:
         return
 
     cuda_available = torch.cuda.is_available()
+    expects_remote_cuda = device_arg == "cuda"
     print("\n" + "=" * 60)
     print("Remote execution via ClearML Agent")
     print("=" * 60)
-    print(f"CUDA available: {cuda_available}")
-    if not cuda_available:
+    print(f"Local CUDA available: {cuda_available}")
+    print(f"Requested device: {device_arg}")
+
+    # Важный случай: локальная машина может быть без CUDA, но агент в очереди - с GPU.
+    # Если пользователь явно просит --device cuda, не подменяем зависимости на CPU.
+    if not cuda_available and not expects_remote_cuda:
         Task.ignore_requirements("torch")
         Task.ignore_requirements("torchvision")
         Task.ignore_requirements("torchaudio")
         Task.add_requirements("torch", ">=2.0.0")
         Task.add_requirements("torchvision", ">=0.15.0")
         print("Configured CPU torch requirements for agent")
+    elif expects_remote_cuda:
+        print("Keeping GPU-oriented torch requirements for the remote agent")
     print("=" * 60 + "\n")
 
 
@@ -532,7 +539,7 @@ def main() -> None:
     args = parse_args()
     config = TrainConfig(**vars(args))
 
-    prepare_remote_environment(config.execute_remotely)
+    prepare_remote_environment(config.execute_remotely, config.device)
     task = init_task(config)
 
     if config.execute_remotely:
