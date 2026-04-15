@@ -115,3 +115,35 @@ python pyTorch_Dataset.py \
 ```
 
 Все задачи и артефакты отслеживаются в ClearML UI.
+
+---
+
+### 3. Streamlit приложение — `streamlit_app.py`
+
+Интерфейс для восстановления изображений через обученную модель ClearML.
+
+**Как это работает:**
+1. Загружаете изображение (png, jpeg, bmp, tif, webp и др.)
+2. Изображение автоматически ресайзится до 1000×1000
+3. Через ClearML скачивается модель (`best_model_stage1.pth`, task ID: `42a49340fb854bbcaa5424ed068395be`) — если ещё не кэширована
+4. Модель восстанавливает качество через tiled inference (UNetConvAE, residual learning)
+5. Результат возвращается с сохранением оригинальных пропорций (без сжатия до исходного маленького размера)
+
+**Запуск:**
+
+```bash
+uv run streamlit run streamlit_app.py
+```
+
+Приложение откроется в браузере по адресу `http://localhost:8501`.
+
+**Параметры модели (внутри приложения):**
+
+| Параметр | Значение |
+|----------|----------|
+| ClearML Task ID | `42a49340fb854bbcaa5424ed068395be` |
+| Артефакт | `best_model_stage1.pth` |
+| Архитектура | UNetConvAE (residual, base_channels=16) |
+| Tile size | 512 |
+| Tile overlap | 64 |
+| Residual scale | 0.7 |
