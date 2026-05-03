@@ -4,10 +4,7 @@ Streamlit приложение для восстановления изобра�
 """
 
 import io
-import os
 import sys
-import tempfile
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -16,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from clearml import Task
 from PIL import Image
+from pytorch_msssim import ssim
 
 # ------------------------------------------------------------
 # Windows guard для ClearML
@@ -32,6 +30,12 @@ TARGET_SIZE = 1000  # модель обучалась на патчах/тайл
 TILE_SIZE = 512
 TILE_OVERLAP = 64
 RESIDUAL_SCALE = 0.7  # из config stage1
+CLASSICAL_METHODS = {
+    "lanczos": "Lanczos resampling",
+    "bicubic": "Bicubic interpolation",
+    "tv": "Total Variation regularization",
+    "nedi": "NEDI (edge-directed, approximation)",
+}
 
 
 # ------------------------------------------------------------
@@ -241,6 +245,92 @@ def restore_aspect_ratio(pil_image: Image.Image, original_size: tuple[int, int])
     return pil_image.resize((new_w, new_h), Image.LANCZOS)
 
 
+def get_output_size(original_size: tuple[int, int]) -> tuple[int, int]:
+    """Финальный размер вывода с сохранением пропорций и max side = TARGET_SIZE."""
+    orig_w, orig_h = original_size
+    orig_ratio = orig_w / orig_h
+
+    if orig_w >= orig_h:
+        return TARGET_SIZE, int(TARGET_SIZE / orig_ratio)
+    return int(TARGET_SIZE * orig_ratio), TARGET_SIZE
+
+
+def tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
+    image_np = image_tensor.detach().cpu().permute(1, 2, 0).numpy()
+    image_np = np.clip(image_np * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(image_np)
+
+
+def pil_to_tensor(pil_image: Image.Image) -> torch.Tensor:
+    image_np = np.array(pil_image.convert("RGB"), dtype=np.float32) / 255.0
+    return torch.from_numpy(image_np).permute(2, 0, 1)
+
+
+def resize_with_method(image: Image.Image, size: tuple[int, int], method: str) -> Image.Image:
+    if method == "lanczos":
+        return image.resize(size, Image.LANCZOS)
+    if method == "bicubic":
+        return image.resize(size, Image.BICUBIC)
+    raise ValueError(f"Unknown resize method: {method}")
+
+
+def tv_regularization(image: np.ndarray, weight: float = 0.12, iterations: int = 80) -> np.ndarray:
+    """Приближение TV-denoising через OpenCV denoise для RGB-изображения."""
+    image_u8 = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    denoised = cv2.fastNlMeansDenoisingColored(image_u8, None, h=8, hColor=8, templateWindowSize=7, searchWindowSize=21)
+    blended = cv2.addWeighted(image_u8, 1.0 - weight, denoised, weight, 0)
+    return blended.astype(np.float32) / 255.0
+
+
+def nedi_approximation(image: np.ndarray) -> np.ndarray:
+    """Edge-directed аппроксимация: bicubic + edge-preserving smoothing."""
+    image_u8 = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    filtered = cv2.edgePreservingFilter(image_u8, flags=1, sigma_s=60, sigma_r=0.4)
+    sharpened = cv2.addWeighted(image_u8, 0.35, filtered, 0.65, 0)
+    return sharpened.astype(np.float32) / 255.0
+
+
+def run_classical_method(method: str, input_image: Image.Image, original_size: tuple[int, int]) -> Image.Image:
+    output_size = get_output_size(original_size)
+
+    if method in {"lanczos", "bicubic"}:
+        return resize_with_method(input_image, output_size, method)
+
+    # Для классических методов без нейросети строим baseline из исходного LQ
+    # через метод-специфичное масштабирование, а затем применяем фильтрацию.
+    base_resized = input_image.resize(output_size, Image.BICUBIC)
+    image_np = np.array(base_resized, dtype=np.float32) / 255.0
+    if method == "tv":
+        restored_np = tv_regularization(image_np)
+    elif method == "nedi":
+        restored_np = nedi_approximation(image_np)
+    else:
+        raise ValueError(f"Unsupported classical method: {method}")
+
+    return Image.fromarray(np.clip(restored_np * 255.0, 0, 255).astype(np.uint8))
+
+
+def prepare_reference_image(reference_image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    return reference_image.convert("RGB").resize(target_size, Image.LANCZOS)
+
+
+def compute_metrics(pred_image: Image.Image, target_image: Image.Image) -> dict[str, float]:
+    pred_tensor = pil_to_tensor(pred_image).unsqueeze(0)
+    target_tensor = pil_to_tensor(target_image).unsqueeze(0)
+
+    mse = torch.mean((pred_tensor - target_tensor) ** 2).item()
+    mae = torch.mean(torch.abs(pred_tensor - target_tensor)).item()
+    psnr = 100.0 if mse <= 1e-12 else 20.0 * np.log10(1.0 / np.sqrt(mse))
+    ssim_value = float(ssim(pred_tensor, target_tensor, data_range=1.0, size_average=True).item())
+
+    return {
+        "PSNR": psnr,
+        "SSIM": ssim_value,
+        "MSE": mse,
+        "MAE": mae,
+    }
+
+
 # ------------------------------------------------------------
 # Streamlit UI
 # ------------------------------------------------------------
@@ -265,6 +355,11 @@ def main():
         type=["png", "jpeg", "jpg", "bmp", "tif", "tiff", "webp"],
     )
 
+    reference_file = st.file_uploader(
+        "Опционально: загрузите эталонное HQ-изображение для расчёта метрик",
+        type=["png", "jpeg", "jpg", "bmp", "tif", "tiff", "webp"],
+    )
+
     if uploaded_file is not None:
         # Чтение изображения
         pil_image = Image.open(uploaded_file).convert("RGB")
@@ -275,6 +370,15 @@ def main():
         with col1:
             st.subheader("Оригинал (LQ)")
             st.image(pil_image, width='stretch')
+
+        selected_methods = st.multiselect(
+            "Классические методы для сравнения",
+            options=list(CLASSICAL_METHODS.keys()),
+            default=["lanczos", "bicubic"],
+            format_func=lambda key: CLASSICAL_METHODS[key],
+        )
+        run_comparison = st.button("Запустить сравнение", use_container_width=True)
+        st.caption("NEDI реализован как edge-directed approximation без отдельной нейросети.")
 
         # Препроцессинг
         img_tensor, original_size = preprocess_image(pil_image)
@@ -297,9 +401,7 @@ def main():
             ).squeeze(0)
 
             # Конвертация обратно в PIL
-            pred_np = pred_tensor.cpu().permute(1, 2, 0).numpy()
-            pred_np = np.clip(pred_np * 255.0, 0, 255).astype(np.uint8)
-            pred_pil = Image.fromarray(pred_np)
+            pred_pil = tensor_to_pil(pred_tensor.cpu())
 
             # Возвращаем оригинальные пропорции
             pred_pil = restore_aspect_ratio(pred_pil, original_size)
@@ -308,6 +410,51 @@ def main():
         with col2:
             st.subheader("Восстановленное (HQ)")
             st.image(pred_pil, width='stretch')
+
+        reference_pil = None
+        if reference_file is not None:
+            reference_pil = prepare_reference_image(Image.open(reference_file), pred_pil.size)
+            st.subheader("Эталонное HQ для метрик")
+            st.image(reference_pil, width="stretch")
+
+        metrics_rows: list[dict[str, float | str]] = []
+        if reference_pil is not None:
+            nn_metrics = compute_metrics(pred_pil, reference_pil)
+            metrics_rows.append(
+                {
+                    "Method": "Neural network",
+                    **nn_metrics,
+                }
+            )
+
+        if run_comparison:
+            if not selected_methods:
+                st.warning("Выберите хотя бы один классический метод для сравнения.")
+            else:
+                st.subheader("Сравнение с классическими методами")
+                comparison_columns = st.columns(max(1, len(selected_methods)))
+                for idx, method in enumerate(selected_methods):
+                    result_image = run_classical_method(method, pil_image, original_size)
+                    with comparison_columns[idx]:
+                        st.markdown(f"**{CLASSICAL_METHODS[method]}**")
+                        st.image(result_image, width="stretch")
+
+                    row = {
+                        "Method": CLASSICAL_METHODS[method],
+                        "PSNR": np.nan,
+                        "SSIM": np.nan,
+                        "MSE": np.nan,
+                        "MAE": np.nan,
+                    }
+                    if reference_pil is not None:
+                        row.update(compute_metrics(result_image, reference_pil))
+                    metrics_rows.append(row)
+
+        if metrics_rows:
+            st.subheader("Метрики")
+            st.dataframe(metrics_rows, width="stretch")
+        else:
+            st.info("Чтобы получить PSNR/SSIM/MSE/MAE, загрузите эталонное HQ-изображение.")
 
         # Кнопка скачивания
         buf = io.BytesIO()
