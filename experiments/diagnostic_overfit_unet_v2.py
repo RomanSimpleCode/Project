@@ -1,3 +1,16 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+"""
+Diagnostic overfit-test for FloorPlanCAD LQ -> HQ restoration.
+
+Goal:
+- Take a tiny subset: 1-5 paired images.
+- Train the model until it almost memorizes them.
+- If losses do not drop strongly, the model/loss/data pipeline is wrong.
+
+Designed for Google Colab + ClearML Dataset.
+"""
 
 import os
 import random
@@ -20,21 +33,39 @@ from clearml import Task, Dataset as ClearMLDataset
 # =========================================================
 # CLEARML CREDENTIALS
 # =========================================================
+def _safe_secret_to_str(value):
+    """Colab/Jupyter-safe conversion for getpass-like return values."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for k in ("value", "text", "secret", "key"):
+            if k in value and isinstance(value[k], str):
+                return value[k]
+    return str(value)
+
+
 def setup_clearml_credentials():
-    api_host = os.environ.get("CLEARML_API_HOST", "https://api.clear.ml")
-    web_host = os.environ.get("CLEARML_WEB_HOST", "https://app.clear.ml")
-    files_host = os.environ.get("CLEARML_FILES_HOST", "https://files.clear.ml")
-    key = os.environ.get("ZCGVG8PSQJOOZNASXTHNO3MLHWXK6G")
-    secret = os.environ.get("KQ46iRWMS_IRDUuB8BggNUZwj-3e_0CvEWmQXJU3pIWfanybc6smB4tfxxGKbQ1qSKI")
+    """
+    ClearML login for Colab/Jupyter.
 
+    Prefer environment variables when available:
+        CLEARML_API_ACCESS_KEY
+        CLEARML_API_SECRET_KEY
 
-    if not key:
-        key = getpass("ClearML API access key: ")
-        os.environ["CLEARML_API_ACCESS_KEY"] = key
+    Otherwise asks interactively.
+    """
+    api_host = str(os.environ.get("CLEARML_API_HOST", "https://api.clear.ml"))
+    web_host = str(os.environ.get("CLEARML_WEB_HOST", "https://app.clear.ml"))
+    files_host = str(os.environ.get("CLEARML_FILES_HOST", "https://files.clear.ml"))
 
-    if not secret:
-        secret = getpass("ClearML API secret key: ")
-        os.environ["CLEARML_API_SECRET_KEY"] = secret
+    key = os.environ.get("CLEARML_API_ACCESS_KEY")
+    secret = os.environ.get("CLEARML_API_SECRET_KEY")
+
+    if not isinstance(key, str) or not key:
+        key = _safe_secret_to_str(getpass("ClearML API access key: "))
+
+    if not isinstance(secret, str) or not secret:
+        secret = _safe_secret_to_str(getpass("ClearML API secret key: "))
 
     Task.set_credentials(
         api_host=api_host,
@@ -51,22 +82,22 @@ def setup_clearml_credentials():
 CONFIG = {
     "project_name": "Vosstanovlenie_tehnicheskih_sistem",
     "task_name": "diagnostic_overfit_unet_v1",
-    "clearml_dataset_id": "aa90ed3c5ca14bec9f9828a8891a5a59",
+    "clearml_dataset_id": "PUT_YOUR_DATASET_ID_HERE",
 
     "image_size": 1024,
-    "patch_size": 512,
+    "patch_size": 256,
     "num_images": 3,
-    "patches_per_image": 16,
+    "patches_per_image": 4,
     "batch_size": 2,
     "num_workers": 2,
 
-    "epochs": 300,
-    "lr": 2e-4,
+    "epochs": 60,
+    "lr": 1e-3,
     "weight_decay": 0.0,
-    "base_channels": 48,
+    "base_channels": 64,
 
     # Much larger than 0.02. For diagnostic, the model must be allowed to change pixels.
-    "residual_scale": 0.25,
+    "residual_scale": 1.0,
 
     "white_threshold": 245,
     "min_content_ratio": 0.01,
@@ -74,7 +105,7 @@ CONFIG = {
 
     "save_dir": "overfit_unet_v1_outputs",
     "seed": 42,
-    "log_every": 5,
+    "log_every": 2,
 }
 
 
@@ -128,28 +159,38 @@ def content_ratio(img: np.ndarray, white_threshold: int = 245) -> float:
     return float((gray < white_threshold).mean())
 
 
-def random_content_crop_pair(lq: np.ndarray, hq: np.ndarray, patch_size: int, min_content_ratio: float, max_attempts: int, white_threshold: int):
+def make_fixed_content_crops(lq: np.ndarray, hq: np.ndarray, patch_size: int, patches_per_image: int, white_threshold: int):
+    """
+    Build a fixed set of content-rich crops once.
+    This is important for a real overfit-test: the model must see the same patches every epoch.
+    """
     h, w = hq.shape[:2]
+    candidates = []
 
-    best = None
-    best_ratio = -1.0
+    # regular grid candidates
+    steps_y = [0, max(0, (h - patch_size) // 2), max(0, h - patch_size)]
+    steps_x = [0, max(0, (w - patch_size) // 2), max(0, w - patch_size)]
 
-    for _ in range(max_attempts):
-        y = random.randint(0, h - patch_size)
-        x = random.randint(0, w - patch_size)
+    for y in steps_y:
+        for x in steps_x:
+            lq_patch = lq[y:y + patch_size, x:x + patch_size]
+            hq_patch = hq[y:y + patch_size, x:x + patch_size]
+            ratio = content_ratio(hq_patch, white_threshold)
+            candidates.append((ratio, y, x, lq_patch, hq_patch))
 
+    # add deterministic pseudo-random candidates
+    rng = random.Random(12345)
+    for _ in range(64):
+        y = rng.randint(0, h - patch_size)
+        x = rng.randint(0, w - patch_size)
         lq_patch = lq[y:y + patch_size, x:x + patch_size]
         hq_patch = hq[y:y + patch_size, x:x + patch_size]
         ratio = content_ratio(hq_patch, white_threshold)
+        candidates.append((ratio, y, x, lq_patch, hq_patch))
 
-        if ratio > best_ratio:
-            best = (lq_patch, hq_patch, ratio)
-            best_ratio = ratio
-
-        if ratio >= min_content_ratio:
-            return lq_patch, hq_patch, ratio
-
-    return best
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    selected = candidates[:patches_per_image]
+    return [(item[3], item[4], item[0]) for item in selected]
 
 
 def augment_pair(lq: np.ndarray, hq: np.ndarray):
@@ -181,34 +222,32 @@ class TinyOverfitDataset(Dataset):
         if not stems:
             raise RuntimeError("No paired files found")
 
-        self.pairs = []
+        self.samples = []
         for stem in stems:
             lq = read_rgb(os.path.join(lq_dir, lq_files[stem]))
             hq = read_rgb(os.path.join(hq_dir, hq_files[stem]))
 
             lq = resize_with_aspect_and_pad_rgb(lq, cfg["image_size"], pad_value=255)
             hq = resize_with_aspect_and_pad_rgb(hq, cfg["image_size"], pad_value=255)
-            self.pairs.append((lq, hq, stem))
 
-        print(f"TinyOverfitDataset: {len(self.pairs)} images, {len(self)} patches per epoch")
+            fixed_crops = make_fixed_content_crops(
+                lq=lq,
+                hq=hq,
+                patch_size=cfg["patch_size"],
+                patches_per_image=cfg["patches_per_image"],
+                white_threshold=cfg["white_threshold"],
+            )
+
+            for crop_id, (lq_patch, hq_patch, ratio) in enumerate(fixed_crops):
+                self.samples.append((lq_patch, hq_patch, f"{stem}_crop{crop_id}", ratio))
+
+        print(f"TinyOverfitDataset: {len(stems)} images, {len(self.samples)} fixed patches total")
 
     def __len__(self):
-        return len(self.pairs) * self.cfg["patches_per_image"]
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        img_idx = idx % len(self.pairs)
-        lq, hq, stem = self.pairs[img_idx]
-
-        lq_patch, hq_patch, ratio = random_content_crop_pair(
-            lq,
-            hq,
-            patch_size=self.cfg["patch_size"],
-            min_content_ratio=self.cfg["min_content_ratio"],
-            max_attempts=self.cfg["max_crop_attempts"],
-            white_threshold=self.cfg["white_threshold"],
-        )
-
-        lq_patch, hq_patch = augment_pair(lq_patch, hq_patch)
+        lq_patch, hq_patch, stem, ratio = self.samples[idx]
         return to_tensor(lq_patch), to_tensor(hq_patch), stem, torch.tensor(ratio, dtype=torch.float32)
 
 
@@ -314,6 +353,12 @@ def line_mask(target: torch.Tensor, white_threshold: float = 245 / 255.0) -> tor
 
 
 def restoration_loss(pred: torch.Tensor, target: torch.Tensor):
+    """
+    Diagnostic loss v2.
+
+    For overfit-test we intentionally remove edge loss from optimization.
+    Edge loss is still logged separately, but it should not dominate memorization.
+    """
     l1 = F.l1_loss(pred, target)
 
     mask = line_mask(target)
@@ -321,7 +366,7 @@ def restoration_loss(pred: torch.Tensor, target: torch.Tensor):
 
     edge_l1 = F.l1_loss(sobel_edges(pred), sobel_edges(target))
 
-    loss = 0.35 * l1 + 0.45 * weighted_l1 + 0.20 * edge_l1
+    loss = 0.20 * l1 + 0.80 * weighted_l1
     return loss, {
         "l1": l1.detach(),
         "weighted_l1": weighted_l1.detach(),
@@ -387,7 +432,10 @@ def main():
         task_type=Task.TaskTypes.training,
         reuse_last_task_id=False,
     )
-    cfg = task.connect(cfg)
+
+    # Important: do not overwrite cfg with task.connect(cfg).
+    # In notebooks/ClearML this can lead to non-plain values being passed into os/path functions.
+    task.connect(cfg)
     logger = task.get_logger()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -487,7 +535,7 @@ def main():
         print(
             f"Epoch {epoch:04d}/{cfg['epochs']} | "
             f"loss={avg_loss:.6f} | l1={avg_l1:.6f} | "
-            f"weighted_l1={avg_wl1:.6f} | edge={avg_edge:.6f} | "
+            f"weighted_l1={avg_wl1:.6f} | edge_ref={avg_edge:.6f} | "
             f"line_l1={avg_line_l1:.6f} | psnr_ref={avg_psnr:.3f}"
         )
 
