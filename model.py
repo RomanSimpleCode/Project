@@ -11,12 +11,10 @@
 
 
 import os
-import cv2
-import csv
-import json
-import shutil
 import random
+import json
 import numpy as np
+import cv2
 import matplotlib.pyplot as plt
 
 import torch
@@ -41,18 +39,28 @@ Task.set_credentials(
 
 
 # =========================================================
+# CLEARML TASK
+# =========================================================
+old_task = Task.current_task()
+if old_task is not None:
+    old_task.close()
+
+task = Task.init(
+    project_name="Vosstanovlenie_tehnicheskih_sistem",
+    task_name="V24_Residual_UNet_FullDataset_MSE",
+    task_type=Task.TaskTypes.training,
+    reuse_last_task_id=False,
+)
+
+logger = task.get_logger()
+
+
+# =========================================================
 # CONFIG
 # =========================================================
 config = {
-    # Старый исходный датасет
-    "source_clearml_dataset_id": "3ea1e9f808034406bdf383ff1bbb32f4",
-
-    # Новый датасет с более жёстким фильтром
-    "new_dataset_project": "Vosstanovlenie_tehnicheskih_sistem",
-    "new_dataset_name": "Filtered_Content_GT_005",
-
-    # Фильтр: минимум 5% не-белых пикселей в HQ
-    "min_hq_content_ratio": 0.05,
+    # Полный исходный датасет — лучший результат был именно на нём
+    "clearml_dataset_id": "3ea1e9f808034406bdf383ff1bbb32f4",
 
     # Data
     "image_size": 1000,
@@ -69,48 +77,72 @@ config = {
     "pad_value": 255,
 
     # Dataloader
-    "batch_size": 8,
+    "batch_size": 4,
     "num_workers": 2,
 
     # Model
     "base_channels": 32,
     "dropout_rate": 0.0,
 
-    # Training
-    # ВАЖНО: обучаем как раньше — мягко, residual_scale=0.02.
-    # Потом на inference проверяем scale sweep.
+    # Обучаем мягкую поправку, потом подбираем scale
     "train_residual_scale": 0.02,
 
-    "epochs": 60,
+    # Training
+    "epochs": 80,
     "lr": 1e-4,
     "weight_decay": 1e-6,
-    "early_stopping_patience": 10,
+    "early_stopping_patience": 12,
 
     # Scale sweep after training
-    "sweep_scales": [0.02, 0.05, 0.07, 0.10],
+    "sweep_scales": [0.02, 0.05, 0.07, 0.10, 0.12],
 
+    # Logging / saving
     "seed": 42,
-    "work_dir": "v22_filtered_005_work",
-    "save_dir": "v22_filtered_residual_mse",
+    "save_dir": "v24_residual_unet_full_dataset",
     "log_images_every": 1,
     "save_epoch_every": 5,
 }
 
+config = task.connect(config)
+
+os.makedirs(config["save_dir"], exist_ok=True)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device: {device}")
+
+if device == "cuda":
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    logger.report_text(f"GPU: {torch.cuda.get_device_name(0)}")
+
+
+# =========================================================
+# SEED
+# =========================================================
 random.seed(config["seed"])
 np.random.seed(config["seed"])
 torch.manual_seed(config["seed"])
 torch.cuda.manual_seed_all(config["seed"])
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.backends.cudnn.benchmark = True
-
-print(f"Device: {device}")
-if device == "cuda":
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 
 # =========================================================
-# HELPER FUNCTIONS
+# DATASET DOWNLOAD
+# =========================================================
+dataset_artifact = ClearMLDataset.get(dataset_id=config["clearml_dataset_id"])
+local_path = dataset_artifact.get_local_copy()
+
+print(f"Dataset: {local_path}")
+logger.report_text(f"Dataset path: {local_path}")
+
+lq_dir = os.path.join(local_path, "LQ")
+hq_dir = os.path.join(local_path, "HQ")
+
+assert os.path.isdir(lq_dir), f"LQ folder not found: {lq_dir}"
+assert os.path.isdir(hq_dir), f"HQ folder not found: {hq_dir}"
+
+
+# =========================================================
+# HELPERS
 # =========================================================
 def read_rgb(path):
     img = cv2.imread(path, cv2.IMREAD_COLOR)
@@ -252,283 +284,7 @@ def sharpen_tensor(lq):
 
 
 # =========================================================
-# STEP 1 — CREATE FILTERED DATASET 0.05
-# =========================================================
-old_task = Task.current_task()
-if old_task is not None:
-    old_task.close()
-
-filter_task = Task.init(
-    project_name="Vosstanovlenie_tehnicheskih_sistem",
-    task_name="V22_Create_Filtered_Content_GT_005",
-    task_type=Task.TaskTypes.data_processing,
-    reuse_last_task_id=False,
-)
-
-filter_logger = filter_task.get_logger()
-
-filter_config = {
-    k: config[k]
-    for k in [
-        "source_clearml_dataset_id",
-        "new_dataset_project",
-        "new_dataset_name",
-        "min_hq_content_ratio",
-        "image_size",
-        "white_threshold",
-        "pad_value",
-        "work_dir",
-        "seed",
-    ]
-}
-
-filter_config = filter_task.connect(filter_config)
-
-os.makedirs(config["work_dir"], exist_ok=True)
-
-analysis_dir = os.path.join(config["work_dir"], "analysis")
-filtered_root = os.path.join(config["work_dir"], "filtered_dataset")
-filtered_lq_dir = os.path.join(filtered_root, "LQ")
-filtered_hq_dir = os.path.join(filtered_root, "HQ")
-
-os.makedirs(analysis_dir, exist_ok=True)
-os.makedirs(filtered_lq_dir, exist_ok=True)
-os.makedirs(filtered_hq_dir, exist_ok=True)
-
-source_dataset = ClearMLDataset.get(
-    dataset_id=config["source_clearml_dataset_id"]
-)
-
-source_local_path = source_dataset.get_local_copy()
-
-print(f"Source dataset: {source_local_path}")
-
-source_lq_dir = os.path.join(source_local_path, "LQ")
-source_hq_dir = os.path.join(source_local_path, "HQ")
-
-assert os.path.isdir(source_lq_dir)
-assert os.path.isdir(source_hq_dir)
-
-exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
-
-lq_files = {
-    os.path.splitext(f)[0]: f
-    for f in os.listdir(source_lq_dir)
-    if f.lower().endswith(exts)
-}
-
-hq_files = {
-    os.path.splitext(f)[0]: f
-    for f in os.listdir(source_hq_dir)
-    if f.lower().endswith(exts)
-}
-
-common_stems = sorted(set(lq_files.keys()) & set(hq_files.keys()))
-
-if len(common_stems) == 0:
-    raise RuntimeError("No paired LQ/HQ images found")
-
-print(f"Total paired images: {len(common_stems)}")
-
-records = []
-
-for i, stem in enumerate(common_stems):
-    lq_path = os.path.join(source_lq_dir, lq_files[stem])
-    hq_path = os.path.join(source_hq_dir, hq_files[stem])
-
-    hq_img = read_rgb(hq_path)
-
-    hq_img = resize_with_aspect_and_pad_rgb(
-        hq_img,
-        target_size=config["image_size"],
-        pad_value=config["pad_value"]
-    )
-
-    content_ratio = calc_content_ratio_rgb(
-        hq_img,
-        white_threshold=config["white_threshold"]
-    )
-
-    records.append(
-        {
-            "stem": stem,
-            "lq_file": lq_files[stem],
-            "hq_file": hq_files[stem],
-            "lq_path": lq_path,
-            "hq_path": hq_path,
-            "hq_content_ratio": content_ratio,
-            "kept": content_ratio >= config["min_hq_content_ratio"],
-        }
-    )
-
-    if (i + 1) % 250 == 0:
-        print(f"Analyzed {i + 1}/{len(common_stems)}")
-
-kept_records = [r for r in records if r["kept"]]
-removed_records = [r for r in records if not r["kept"]]
-
-content_values = np.array([r["hq_content_ratio"] for r in records], dtype=np.float32)
-
-stats = {
-    "total_pairs": len(records),
-    "kept_pairs": len(kept_records),
-    "removed_pairs": len(removed_records),
-    "kept_percent": float(len(kept_records) / len(records) * 100.0),
-    "content_min": float(np.min(content_values)),
-    "content_max": float(np.max(content_values)),
-    "content_mean": float(np.mean(content_values)),
-    "content_median": float(np.median(content_values)),
-    "threshold": config["min_hq_content_ratio"],
-}
-
-print("=" * 80)
-print("FILTER STATS")
-print(json.dumps(stats, ensure_ascii=False, indent=2))
-print("=" * 80)
-
-filter_logger.report_text(json.dumps(stats, ensure_ascii=False, indent=2))
-
-csv_path = os.path.join(analysis_dir, "content_report_005.csv")
-
-with open(csv_path, "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(
-        f,
-        fieldnames=[
-            "stem",
-            "lq_file",
-            "hq_file",
-            "hq_content_ratio",
-            "kept",
-        ]
-    )
-
-    writer.writeheader()
-
-    for rec in records:
-        writer.writerow(
-            {
-                "stem": rec["stem"],
-                "lq_file": rec["lq_file"],
-                "hq_file": rec["hq_file"],
-                "hq_content_ratio": rec["hq_content_ratio"],
-                "kept": rec["kept"],
-            }
-        )
-
-hist_path = os.path.join(analysis_dir, "content_ratio_histogram_005.png")
-
-plt.figure(figsize=(10, 6))
-plt.hist(content_values, bins=50)
-plt.axvline(config["min_hq_content_ratio"], linestyle="--", linewidth=2)
-plt.title("HQ content ratio distribution")
-plt.xlabel("content_ratio")
-plt.ylabel("count")
-plt.tight_layout()
-plt.savefig(hist_path, dpi=150, bbox_inches="tight")
-plt.close()
-
-filter_logger.report_image(
-    title="Dataset Analysis",
-    series="content_ratio_histogram_005",
-    iteration=0,
-    local_path=hist_path
-)
-
-print("Copying filtered dataset...")
-
-for i, rec in enumerate(kept_records):
-    shutil.copy2(rec["lq_path"], os.path.join(filtered_lq_dir, rec["lq_file"]))
-    shutil.copy2(rec["hq_path"], os.path.join(filtered_hq_dir, rec["hq_file"]))
-
-    if (i + 1) % 250 == 0:
-        print(f"Copied {i + 1}/{len(kept_records)}")
-
-summary = {
-    "source_clearml_dataset_id": config["source_clearml_dataset_id"],
-    "new_dataset_name": config["new_dataset_name"],
-    "filter": {
-        "metric": "hq_content_ratio",
-        "min_hq_content_ratio": config["min_hq_content_ratio"],
-        "white_threshold": config["white_threshold"],
-        "image_size": config["image_size"],
-    },
-    "stats": stats,
-}
-
-summary_path = os.path.join(filtered_root, "filter_summary.json")
-report_copy_path = os.path.join(filtered_root, "content_report.csv")
-
-with open(summary_path, "w", encoding="utf-8") as f:
-    json.dump(summary, f, ensure_ascii=False, indent=2)
-
-shutil.copy2(csv_path, report_copy_path)
-
-print("Creating new ClearML dataset...")
-
-new_dataset = ClearMLDataset.create(
-    dataset_name=config["new_dataset_name"],
-    dataset_project=config["new_dataset_project"],
-)
-
-new_dataset.add_files(path=filtered_root)
-new_dataset.upload()
-new_dataset.finalize()
-
-new_dataset_id = new_dataset.id
-
-print("=" * 80)
-print("NEW FILTERED DATASET CREATED")
-print(f"New dataset id: {new_dataset_id}")
-print(f"Kept pairs: {len(kept_records)} / {len(records)}")
-print("=" * 80)
-
-filter_task.upload_artifact("content_report_csv", csv_path)
-filter_task.upload_artifact("filter_summary", summary_path)
-filter_task.upload_artifact("analysis", analysis_dir)
-
-filter_logger.report_text(
-    f"New filtered dataset created: {new_dataset_id}\n"
-    f"Kept {len(kept_records)} / {len(records)} pairs"
-)
-
-filter_task.close()
-
-
-# =========================================================
-# STEP 2 — TRAIN RESIDUAL ConvAE FROM SCRATCH ON NEW DATASET
-# =========================================================
-train_task = Task.init(
-    project_name="Vosstanovlenie_tehnicheskih_sistem",
-    task_name="V22_Filtered005_Residual_ConvAE_MSE_FromScratch",
-    task_type=Task.TaskTypes.training,
-    reuse_last_task_id=False,
-)
-
-logger = train_task.get_logger()
-
-train_config = dict(config)
-train_config["clearml_dataset_id"] = new_dataset_id
-
-train_config = train_task.connect(train_config)
-
-os.makedirs(config["save_dir"], exist_ok=True)
-
-dataset_artifact = ClearMLDataset.get(dataset_id=new_dataset_id)
-local_path = dataset_artifact.get_local_copy()
-
-print(f"Training dataset: {local_path}")
-logger.report_text(f"Training dataset: {local_path}")
-logger.report_text(f"New filtered dataset id: {new_dataset_id}")
-
-lq_dir = os.path.join(local_path, "LQ")
-hq_dir = os.path.join(local_path, "HQ")
-
-assert os.path.isdir(lq_dir)
-assert os.path.isdir(hq_dir)
-
-
-# =========================================================
-# DATASET CLASS
+# DATASET
 # =========================================================
 class ContentPatchDataset(Dataset):
     def __init__(
@@ -687,7 +443,11 @@ class ContentPatchDataset(Dataset):
                 lq_patch, hq_patch = augment_pair(lq_patch, hq_patch)
 
         else:
-            lq_patch, hq_patch, content_ratio = self.get_content_patch_val(lq, hq, crop_id)
+            lq_patch, hq_patch, content_ratio = self.get_content_patch_val(
+                lq,
+                hq,
+                crop_id
+            )
 
         return (
             to_tensor(lq_patch),
@@ -698,7 +458,7 @@ class ContentPatchDataset(Dataset):
 
 
 # =========================================================
-# MODEL
+# RESIDUAL U-NET MODEL
 # =========================================================
 def make_gn(ch):
     if ch >= 128:
@@ -724,7 +484,41 @@ class ConvBlock(nn.Module):
         return self.block(x)
 
 
-class ResidualConvAE(nn.Module):
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            make_gn(out_ch),
+            nn.LeakyReLU(0.1, inplace=True),
+        )
+
+        self.conv = ConvBlock(out_ch + skip_ch, out_ch)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(
+                x,
+                size=skip.shape[-2:],
+                mode="bilinear",
+                align_corners=False
+            )
+
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+
+class ResidualUNet(nn.Module):
+    """
+    Residual U-Net:
+    correction = UNet(input)
+    output = input + residual_scale * correction
+    """
+
     def __init__(
         self,
         in_ch=3,
@@ -737,6 +531,7 @@ class ResidualConvAE(nn.Module):
 
         self.residual_scale = residual_scale
 
+        # Encoder
         self.enc1 = ConvBlock(in_ch, base)
         self.pool1 = nn.MaxPool2d(2)
 
@@ -746,37 +541,20 @@ class ResidualConvAE(nn.Module):
         self.enc3 = ConvBlock(base * 2, base * 4)
         self.pool3 = nn.MaxPool2d(2)
 
+        self.enc4 = ConvBlock(base * 4, base * 8)
+        self.pool4 = nn.MaxPool2d(2)
+
+        # Bottleneck
         self.bottleneck = nn.Sequential(
-            ConvBlock(base * 4, base * 4),
+            ConvBlock(base * 8, base * 8),
             nn.Dropout2d(dropout_rate) if dropout_rate > 0 else nn.Identity()
         )
 
-        self.up3 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(base * 4, base * 2, 3, padding=1, bias=False),
-            make_gn(base * 2),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
-
-        self.dec3 = ConvBlock(base * 2, base * 2)
-
-        self.up2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(base * 2, base, 3, padding=1, bias=False),
-            make_gn(base),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
-
-        self.dec2 = ConvBlock(base, base)
-
-        self.up1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(base, base, 3, padding=1, bias=False),
-            make_gn(base),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
-
-        self.dec1 = ConvBlock(base, base)
+        # Decoder with skip connections
+        self.up4 = UpBlock(base * 8, base * 8, base * 4)
+        self.up3 = UpBlock(base * 4, base * 4, base * 2)
+        self.up2 = UpBlock(base * 2, base * 2, base)
+        self.up1 = UpBlock(base, base, base)
 
         self.final = nn.Sequential(
             nn.Conv2d(base, out_ch, 3, padding=1),
@@ -804,15 +582,15 @@ class ResidualConvAE(nn.Module):
         e3 = self.enc3(p2)
         p3 = self.pool3(e3)
 
-        b = self.bottleneck(p3)
+        e4 = self.enc4(p3)
+        p4 = self.pool4(e4)
 
-        d3 = self.up3(b)
-        d3 = self.dec3(d3)
+        b = self.bottleneck(p4)
 
-        d2 = self.up2(d3)
-        d2 = self.dec2(d2)
-
-        d1 = self.up1(d2)
+        d4 = self.up4(b, e4)
+        d3 = self.up3(d4, e3)
+        d2 = self.up2(d3, e2)
+        d1 = self.up1(d2, e1)
 
         if d1.shape[-2:] != original_size:
             d1 = F.interpolate(
@@ -821,8 +599,6 @@ class ResidualConvAE(nn.Module):
                 mode="bilinear",
                 align_corners=False
             )
-
-        d1 = self.dec1(d1)
 
         correction = self.final(d1)
 
@@ -855,6 +631,8 @@ def init_weights(m):
 # =========================================================
 # DATA SPLIT
 # =========================================================
+exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
 lq_files = {
     os.path.splitext(f)[0]: f
     for f in os.listdir(lq_dir)
@@ -870,12 +648,17 @@ hq_files = {
 common_stems = sorted(set(lq_files.keys()) & set(hq_files.keys()))
 dataset_len = len(common_stems)
 
-print(f"Total paired images in filtered dataset: {dataset_len}")
+if dataset_len == 0:
+    raise RuntimeError("No paired images found")
+
+print(f"Total paired images: {dataset_len}")
 
 if config["subset_size"] is None or config["subset_size"] <= 0 or config["subset_size"] > dataset_len:
     selected_indices = list(range(dataset_len))
+    print(f"Using full dataset: {dataset_len} images")
 else:
     selected_indices = random.sample(range(dataset_len), config["subset_size"])
+    print(f"Using subset: {len(selected_indices)} / {dataset_len}")
 
 total = len(selected_indices)
 test_size = max(1, int(total * config["test_split"]))
@@ -950,7 +733,7 @@ logger.report_text(f"Train patches: {len(train_dataset)} | Test patches: {len(te
 # =========================================================
 # MODEL / OPTIMIZER
 # =========================================================
-model = ResidualConvAE(
+model = ResidualUNet(
     in_ch=3,
     out_ch=3,
     base=config["base_channels"],
@@ -1002,14 +785,14 @@ def save_checkpoint(path, epoch, best_psnr):
         "scaler_state": scaler.state_dict(),
         "best_psnr": best_psnr,
         "config": dict(config),
-        "filtered_dataset_id": new_dataset_id,
+        "architecture": "ResidualUNet",
     }
 
     torch.save(checkpoint, path)
 
 
 def upload_artifact_safe(name, path):
-    train_task.upload_artifact(name, path)
+    task.upload_artifact(name, path)
     print(f"Uploaded artifact: {name}")
 
 
@@ -1043,7 +826,7 @@ def log_comparison(lq, pred, hq, iteration, series, title):
     save_path = os.path.join(vis_dir, f"epoch_{iteration + 1:03d}.png")
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
-    train_task.upload_artifact(
+    task.upload_artifact(
         name=f"visual_epoch_{iteration + 1:03d}",
         artifact_object=save_path
     )
@@ -1052,7 +835,7 @@ def log_comparison(lq, pred, hq, iteration, series, title):
 
 
 # =========================================================
-# TRAIN LOOP
+# TRAINING LOOP
 # =========================================================
 best_psnr = 0.0
 epochs_no_improve = 0
@@ -1093,6 +876,9 @@ for epoch in range(config["epochs"]):
     logger.report_scalar("Loss", "train_MSE", train_mse, epoch)
     logger.report_scalar("Content", "train_content_ratio", train_content, epoch)
 
+    # =====================================================
+    # VALIDATION
+    # =====================================================
     model.eval()
 
     test_psnr_sum = 0.0
@@ -1180,7 +966,7 @@ for epoch in range(config["epochs"]):
         log_comparison(
             *test_sample,
             iteration=epoch,
-            series="test_examples",
+            series="residual_unet_test_examples",
             title=(
                 f"Epoch {epoch + 1} | "
                 f"Model {test_psnr:.3f} | "
@@ -1241,7 +1027,7 @@ for epoch in range(config["epochs"]):
 
 
 # =========================================================
-# FINAL SCALE SWEEP ON BEST MODEL
+# FINAL SCALE SWEEP
 # =========================================================
 print("=" * 80)
 print("FINAL SCALE SWEEP")
@@ -1270,6 +1056,7 @@ for scale in config["sweep_scales"]:
             hq = hq.to(device, non_blocking=True)
 
             pred = model(lq).float()
+
             hq_f = hq.float()
             lq_f = lq.float()
             sharp_f = sharpen_tensor(lq_f)
@@ -1316,7 +1103,8 @@ for scale in config["sweep_scales"]:
 best_sweep = max(sweep_results.values(), key=lambda x: x["psnr"])
 
 summary = {
-    "new_filtered_dataset_id": new_dataset_id,
+    "architecture": "Residual U-Net",
+    "dataset_id": config["clearml_dataset_id"],
     "best_train_psnr_at_scale_0.02": best_psnr,
     "last_epoch_completed": last_completed_epoch,
     "sweep_results": sweep_results,
@@ -1329,21 +1117,21 @@ summary_path = os.path.join(config["save_dir"], "summary.json")
 with open(summary_path, "w", encoding="utf-8") as f:
     json.dump(summary, f, ensure_ascii=False, indent=2)
 
-train_task.upload_artifact("summary", summary_path)
-train_task.upload_artifact("outputs_folder", config["save_dir"])
+task.upload_artifact("summary", summary_path)
+task.upload_artifact("outputs_folder", config["save_dir"])
 
 print()
 print("=" * 80)
 print("DONE")
-print(f"New filtered dataset id: {new_dataset_id}")
 print(f"Best training PSNR at scale 0.02: {best_psnr:.4f}")
 print(
     f"Best sweep: scale={best_sweep['scale']} | "
     f"PSNR={best_sweep['psnr']:.4f} | "
     f"Gain LQ={best_sweep['gain_lq']:+.4f} | "
+    f"Gain Sharp={best_sweep['gain_sharp']:+.4f} | "
     f"SSIM={best_sweep['ssim']:.4f}"
 )
 print("=" * 80)
 
-train_task.close()
+task.close()
 
