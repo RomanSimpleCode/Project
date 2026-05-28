@@ -1,6 +1,6 @@
 """
 Streamlit приложение для восстановления изображений через ClearML модель.
-Модель: two_stage_one_file.py (UNetConvAE, residual learning)
+Модель: CleanResidualUNet (two_stage_one_file.py)
 """
 
 import io
@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from clearml import Task
 from PIL import Image
 from pytorch_msssim import ssim
+from two_stage_one_file import CONFIG, CleanResidualUNet
 
 # ------------------------------------------------------------
 # Windows guard для ClearML
@@ -24,12 +25,11 @@ if sys.platform == "win32":
 # ------------------------------------------------------------
 # Константы
 # ------------------------------------------------------------
-MODEL_TASK_ID = "42a49340fb854bbcaa5424ed068395be"
-MODEL_ARTIFACT_NAME = "best_model_stage1.pth"
-TARGET_SIZE = 1000  # модель обучалась на патчах/тайлах, приводим к этому размеру
+MODEL_TASK_ID = "bc17547fbb28414c80122a671060c2f4"
+MODEL_ARTIFACT_NAME = "best_model"
+TARGET_SIZE = CONFIG.get("image_size", 1024)
 TILE_SIZE = 512
 TILE_OVERLAP = 64
-RESIDUAL_SCALE = 0.7  # из config stage1
 CLASSICAL_METHODS = {
     "lanczos": "Lanczos resampling",
     "bicubic": "Bicubic interpolation",
@@ -39,104 +39,14 @@ CLASSICAL_METHODS = {
 
 
 # ------------------------------------------------------------
-# Модель (копия из two_stage_one_file.py)
-# ------------------------------------------------------------
-class ConvBlock(torch.nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.block = torch.nn.Sequential(
-            torch.nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-            torch.nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class DownBlock(torch.nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.down = torch.nn.Sequential(
-            torch.nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-            torch.nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-        )
-
-    def forward(self, x):
-        return self.down(x)
-
-
-class UpBlock(torch.nn.Module):
-    def __init__(self, in_ch, skip_ch, out_ch):
-        super().__init__()
-        self.conv = torch.nn.Sequential(
-            torch.nn.Conv2d(in_ch + skip_ch, out_ch, kernel_size=3, padding=1),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-            torch.nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-        )
-
-    def forward(self, x, skip):
-        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
-
-
-class UNetConvAE(torch.nn.Module):
-    def __init__(self, in_channels=3, out_channels=3, base_channels=16):
-        super().__init__()
-        b = base_channels
-
-        self.enc1 = ConvBlock(in_channels, b)
-        self.enc2 = DownBlock(b, b * 2)
-        self.enc3 = DownBlock(b * 2, b * 4)
-        self.enc4 = DownBlock(b * 4, b * 8)
-
-        self.bottleneck = torch.nn.Sequential(
-            torch.nn.Conv2d(b * 8, b * 16, kernel_size=3, stride=2, padding=1),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-            torch.nn.Conv2d(b * 16, b * 16, kernel_size=3, padding=1),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-        )
-
-        self.up4 = UpBlock(b * 16, b * 8, b * 8)
-        self.up3 = UpBlock(b * 8, b * 4, b * 4)
-        self.up2 = UpBlock(b * 4, b * 2, b * 2)
-        self.up1 = UpBlock(b * 2, b, b)
-
-        self.final = torch.nn.Conv2d(b, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(e1)
-        e3 = self.enc3(e2)
-        e4 = self.enc4(e3)
-
-        b = self.bottleneck(e4)
-
-        d4 = self.up4(b, e4)
-        d3 = self.up3(d4, e3)
-        d2 = self.up2(d3, e2)
-        d1 = self.up1(d2, e1)
-
-        return self.final(d1)
-
-
-# ------------------------------------------------------------
 # Утилиты
 # ------------------------------------------------------------
 @st.cache_resource
-def load_model_from_clearml() -> UNetConvAE:
-    """Скачивает модель из ClearML (если ещё не кэширована) и загружает в память."""
+def load_model_from_clearml() -> tuple:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Получаем задачу и скачиваем артефакт
     task = Task.get_task(task_id=MODEL_TASK_ID)
 
-    # Ищем артефакт с именем best_model_stage1.pth
     artifact = None
     for art_name, art_obj in task.artifacts.items():
         if art_name == MODEL_ARTIFACT_NAME:
@@ -148,29 +58,33 @@ def load_model_from_clearml() -> UNetConvAE:
         st.stop()
 
     local_path = artifact.get_local_copy()
-    model = UNetConvAE(in_channels=3, out_channels=3, base_channels=16)
-    state_dict = torch.load(local_path, map_location=device, weights_only=True)
-    model.load_state_dict(state_dict)
+    model = CleanResidualUNet(
+        in_ch=3,
+        out_ch=3,
+        base=CONFIG.get("base_channels", 64),
+        dropout=CONFIG.get("dropout", 0.0),
+        extra_bottleneck_blocks=CONFIG.get("extra_bottleneck_blocks", 2),
+    )
+
+    checkpoint = torch.load(local_path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, dict) and "model_state" in checkpoint:
+        model.load_state_dict(checkpoint["model_state"])
+    else:
+        model.load_state_dict(checkpoint)
+
     model = model.to(device)
     model.eval()
 
     return model, device
 
 
-def apply_residual(lq: torch.Tensor, residual_raw: torch.Tensor, residual_scale: float) -> torch.Tensor:
-    pred = lq + residual_scale * torch.tanh(residual_raw)
-    pred = torch.clamp(pred, 0.0, 1.0)
-    return pred
-
-
-def tiled_inference_residual(
-    model: UNetConvAE,
+def tiled_inference(
+    model: CleanResidualUNet,
     image_tensor: torch.Tensor,
     tile_size: int,
     overlap: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Tiled inference как в two_stage_one_file.py."""
     c, H, W = image_tensor.shape
     stride = tile_size - overlap
     if stride <= 0:
@@ -182,9 +96,9 @@ def tiled_inference_residual(
     ys = list(range(0, max(H - tile_size + 1, 1), stride))
     xs = list(range(0, max(W - tile_size + 1, 1), stride))
 
-    if len(ys) == 0 or ys[-1] != H - tile_size:
+    if not ys or ys[-1] != H - tile_size:
         ys.append(max(H - tile_size, 0))
-    if len(xs) == 0 or xs[-1] != W - tile_size:
+    if not xs or xs[-1] != W - tile_size:
         xs.append(max(W - tile_size, 0))
 
     with torch.no_grad():
@@ -192,45 +106,30 @@ def tiled_inference_residual(
             for x in xs:
                 patch = image_tensor[:, y : y + tile_size, x : x + tile_size]
 
-                if patch.shape[-2:] != (tile_size, tile_size):
-                    pad_h = tile_size - patch.shape[-2]
-                    pad_w = tile_size - patch.shape[-1]
-                    patch = F.pad(patch, (0, pad_w, 0, pad_h), mode="reflect")
+                ph, pw = patch.shape[-2], patch.shape[-1]
+                if ph != tile_size or pw != tile_size:
+                    patch = F.pad(patch, (0, tile_size - pw, 0, tile_size - ph), mode="reflect")
 
-                residual = model(patch.unsqueeze(0).to(device)).cpu().squeeze(0)
-                residual = residual[:, : min(tile_size, H - y), : min(tile_size, W - x)]
+                pred, _ = model(patch.unsqueeze(0).to(device))
+                pred = torch.clamp(pred, 0.0, 1.0).cpu().squeeze(0)
+                pred = pred[:, :ph, :pw]
 
-                output[:, y : y + residual.shape[1], x : x + residual.shape[2]] += residual
-                weight[:, y : y + residual.shape[1], x : x + residual.shape[2]] += 1.0
+                output[:, y : y + ph, x : x + pw] += pred
+                weight[:, y : y + ph, x : x + pw] += 1.0
 
     return output / torch.clamp(weight, min=1e-8)
 
 
-def preprocess_image(pil_image: Image.Image) -> tuple[torch.Tensor, tuple[int, int]]:
-    """
-    Resize до TARGET_SIZE x TARGET_SIZE, конвертация в тензор [0,1] (C, H, W).
-    Возвращает тензор и оригинальный размер (W, H).
-    """
-    original_size = pil_image.size  # (W, H)
-
-    # Resize до 1000x1000
+def preprocess_image(pil_image: Image.Image) -> tuple:
+    original_size = pil_image.size
     img_resized = pil_image.resize((TARGET_SIZE, TARGET_SIZE), Image.LANCZOS)
-
-    # Конвертация в numpy array [0,1]
     img_np = np.array(img_resized, dtype=np.float32) / 255.0
-
-    # HWC -> CHW
     img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)
-
     return img_tensor, original_size
 
 
-def restore_aspect_ratio(pil_image: Image.Image, original_size: tuple[int, int]) -> Image.Image:
-    """Возвращает изображение к оригинальным пропорциям, но не сжимает до исходного размера.
-    Максимальная сторона остаётся TARGET_SIZE."""
+def restore_aspect_ratio(pil_image: Image.Image, original_size: tuple) -> Image.Image:
     orig_w, orig_h = original_size
-    curr_w, curr_h = pil_image.size  # оба = TARGET_SIZE
-
     orig_ratio = orig_w / orig_h
 
     if orig_w >= orig_h:
@@ -240,16 +139,14 @@ def restore_aspect_ratio(pil_image: Image.Image, original_size: tuple[int, int])
         new_h = TARGET_SIZE
         new_w = int(TARGET_SIZE * orig_ratio)
 
-    if (new_w, new_h) == (curr_w, curr_h):
+    if (new_w, new_h) == pil_image.size:
         return pil_image
     return pil_image.resize((new_w, new_h), Image.LANCZOS)
 
 
-def get_output_size(original_size: tuple[int, int]) -> tuple[int, int]:
-    """Финальный размер вывода с сохранением пропорций и max side = TARGET_SIZE."""
+def get_output_size(original_size: tuple) -> tuple:
     orig_w, orig_h = original_size
     orig_ratio = orig_w / orig_h
-
     if orig_w >= orig_h:
         return TARGET_SIZE, int(TARGET_SIZE / orig_ratio)
     return int(TARGET_SIZE * orig_ratio), TARGET_SIZE
@@ -266,7 +163,7 @@ def pil_to_tensor(pil_image: Image.Image) -> torch.Tensor:
     return torch.from_numpy(image_np).permute(2, 0, 1)
 
 
-def resize_with_method(image: Image.Image, size: tuple[int, int], method: str) -> Image.Image:
+def resize_with_method(image: Image.Image, size: tuple, method: str) -> Image.Image:
     if method == "lanczos":
         return image.resize(size, Image.LANCZOS)
     if method == "bicubic":
@@ -274,30 +171,28 @@ def resize_with_method(image: Image.Image, size: tuple[int, int], method: str) -
     raise ValueError(f"Unknown resize method: {method}")
 
 
-def tv_regularization(image: np.ndarray, weight: float = 0.12, iterations: int = 80) -> np.ndarray:
-    """Приближение TV-denoising через OpenCV denoise для RGB-изображения."""
+def tv_regularization(image: np.ndarray, weight: float = 0.12) -> np.ndarray:
     image_u8 = np.clip(image * 255.0, 0, 255).astype(np.uint8)
-    denoised = cv2.fastNlMeansDenoisingColored(image_u8, None, h=8, hColor=8, templateWindowSize=7, searchWindowSize=21)
+    denoised = cv2.fastNlMeansDenoisingColored(
+        image_u8, None, h=8, hColor=8, templateWindowSize=7, searchWindowSize=21
+    )
     blended = cv2.addWeighted(image_u8, 1.0 - weight, denoised, weight, 0)
     return blended.astype(np.float32) / 255.0
 
 
 def nedi_approximation(image: np.ndarray) -> np.ndarray:
-    """Edge-directed аппроксимация: bicubic + edge-preserving smoothing."""
     image_u8 = np.clip(image * 255.0, 0, 255).astype(np.uint8)
     filtered = cv2.edgePreservingFilter(image_u8, flags=1, sigma_s=60, sigma_r=0.4)
     sharpened = cv2.addWeighted(image_u8, 0.35, filtered, 0.65, 0)
     return sharpened.astype(np.float32) / 255.0
 
 
-def run_classical_method(method: str, input_image: Image.Image, original_size: tuple[int, int]) -> Image.Image:
+def run_classical_method(method: str, input_image: Image.Image, original_size: tuple) -> Image.Image:
     output_size = get_output_size(original_size)
 
     if method in {"lanczos", "bicubic"}:
         return resize_with_method(input_image, output_size, method)
 
-    # Для классических методов без нейросети строим baseline из исходного LQ
-    # через метод-специфичное масштабирование, а затем применяем фильтрацию.
     base_resized = input_image.resize(output_size, Image.BICUBIC)
     image_np = np.array(base_resized, dtype=np.float32) / 255.0
     if method == "tv":
@@ -310,11 +205,51 @@ def run_classical_method(method: str, input_image: Image.Image, original_size: t
     return Image.fromarray(np.clip(restored_np * 255.0, 0, 255).astype(np.uint8))
 
 
-def prepare_reference_image(reference_image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+def prepare_reference_image(reference_image: Image.Image, target_size: tuple) -> Image.Image:
     return reference_image.convert("RGB").resize(target_size, Image.LANCZOS)
 
 
-def compute_metrics(pred_image: Image.Image, target_image: Image.Image) -> dict[str, float]:
+def line_mask_tensor(target: torch.Tensor, white_threshold: float = 245 / 255.0) -> torch.Tensor:
+    gray = target.mean(dim=1, keepdim=True)
+    mask = (gray < white_threshold).float()
+    return F.max_pool2d(mask, kernel_size=5, stride=1, padding=2)
+
+
+def sobel_edges_tensor(image: torch.Tensor) -> torch.Tensor:
+    gray = image.mean(dim=1, keepdim=True)
+    kx = torch.tensor(
+        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+        device=image.device,
+        dtype=image.dtype,
+    ).view(1, 1, 3, 3)
+    ky = torch.tensor(
+        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+        device=image.device,
+        dtype=image.dtype,
+    ).view(1, 1, 3, 3)
+    gx = F.conv2d(gray, kx, padding=1)
+    gy = F.conv2d(gray, ky, padding=1)
+    return torch.sqrt(gx * gx + gy * gy + 1e-6)
+
+
+def calc_line_l1_tensor(pred: torch.Tensor, target: torch.Tensor) -> float:
+    mask = line_mask_tensor(target)
+    value = (torch.abs(pred - target) * mask).sum() / (mask.sum() * pred.shape[1] + 1e-6)
+    return float(value.item())
+
+
+def weighted_l1_metric_tensor(pred: torch.Tensor, target: torch.Tensor) -> float:
+    mask_weight = float(CONFIG.get("line_mask_weight", 10.0))
+    mask = line_mask_tensor(target)
+    value = (torch.abs(pred - target) * (1.0 + mask_weight * mask)).mean()
+    return float(value.item())
+
+
+def compute_metrics(
+    pred_image: Image.Image,
+    target_image: Image.Image,
+    baseline_image: Image.Image | None = None,
+) -> dict:
     pred_tensor = pil_to_tensor(pred_image).unsqueeze(0)
     target_tensor = pil_to_tensor(target_image).unsqueeze(0)
 
@@ -322,12 +257,25 @@ def compute_metrics(pred_image: Image.Image, target_image: Image.Image) -> dict[
     mae = torch.mean(torch.abs(pred_tensor - target_tensor)).item()
     psnr = 100.0 if mse <= 1e-12 else 20.0 * np.log10(1.0 / np.sqrt(mse))
     ssim_value = float(ssim(pred_tensor, target_tensor, data_range=1.0, size_average=True).item())
+    line_l1 = calc_line_l1_tensor(pred_tensor, target_tensor)
+    weighted_l1 = weighted_l1_metric_tensor(pred_tensor, target_tensor)
+    edge_ref = float(F.l1_loss(sobel_edges_tensor(pred_tensor), sobel_edges_tensor(target_tensor)).item())
+
+    gain_line = np.nan
+    if baseline_image is not None:
+        baseline_tensor = pil_to_tensor(baseline_image.resize(pred_image.size, Image.LANCZOS)).unsqueeze(0)
+        baseline_line_l1 = calc_line_l1_tensor(baseline_tensor, target_tensor)
+        gain_line = baseline_line_l1 - line_l1
 
     return {
         "PSNR": psnr,
         "SSIM": ssim_value,
         "MSE": mse,
         "MAE": mae,
+        "Line L1": line_l1,
+        "Weighted L1": weighted_l1,
+        "Gain Line": gain_line,
+        "Edge ref": edge_ref,
     }
 
 
@@ -342,14 +290,12 @@ def main():
     )
 
     st.title("🔧 Восстановление изображений")
-    st.caption("Модель: UNetConvAE (two_stage_one_file.py) через ClearML")
+    st.caption("Модель: CleanResidualUNet (two_stage_one_file.py) через ClearML")
 
-    # Загрузка модели
     with st.spinner("Загрузка модели из ClearML..."):
         model, device = load_model_from_clearml()
     st.success(f"Модель загружена на устройстве: **{device}**")
 
-    # Загрузка изображения
     uploaded_file = st.file_uploader(
         "Загрузите изображение",
         type=["png", "jpeg", "jpg", "bmp", "tif", "tiff", "webp"],
@@ -361,11 +307,9 @@ def main():
     )
 
     if uploaded_file is not None:
-        # Чтение изображения
         pil_image = Image.open(uploaded_file).convert("RGB")
         st.info(f"Оригинальный размер: {pil_image.size[0]} x {pil_image.size[1]}")
 
-        # Показываем оригинал
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Оригинал (LQ)")
@@ -380,52 +324,36 @@ def main():
         run_comparison = st.button("Запустить сравнение", use_container_width=True)
         st.caption("NEDI реализован как edge-directed approximation без отдельной нейросети.")
 
-        # Препроцессинг
         img_tensor, original_size = preprocess_image(pil_image)
 
-        # Inference
         with st.spinner("Восстановление изображения..."):
-            residual_raw = tiled_inference_residual(
+            pred_tensor = tiled_inference(
                 model=model,
                 image_tensor=img_tensor,
                 tile_size=TILE_SIZE,
                 overlap=TILE_OVERLAP,
                 device=device,
-            ).to(device)
+            )
 
-            lq_tensor = img_tensor.unsqueeze(0).to(device)
-            pred_tensor = apply_residual(
-                lq=lq_tensor,
-                residual_raw=residual_raw.unsqueeze(0).to(device),
-                residual_scale=RESIDUAL_SCALE,
-            ).squeeze(0)
-
-            # Конвертация обратно в PIL
-            pred_pil = tensor_to_pil(pred_tensor.cpu())
-
-            # Возвращаем оригинальные пропорции
+            pred_pil = tensor_to_pil(pred_tensor)
             pred_pil = restore_aspect_ratio(pred_pil, original_size)
 
-        # Показываем результат
         with col2:
             st.subheader("Восстановленное (HQ)")
             st.image(pred_pil, width='stretch')
 
         reference_pil = None
+        baseline_pil = None
         if reference_file is not None:
             reference_pil = prepare_reference_image(Image.open(reference_file), pred_pil.size)
+            baseline_pil = pil_image.convert("RGB").resize(pred_pil.size, Image.LANCZOS)
             st.subheader("Эталонное HQ для метрик")
             st.image(reference_pil, width="stretch")
 
-        metrics_rows: list[dict[str, float | str]] = []
+        metrics_rows: list[dict] = []
         if reference_pil is not None:
-            nn_metrics = compute_metrics(pred_pil, reference_pil)
-            metrics_rows.append(
-                {
-                    "Method": "Neural network",
-                    **nn_metrics,
-                }
-            )
+            nn_metrics = compute_metrics(pred_pil, reference_pil, baseline_pil)
+            metrics_rows.append({"Method": "CleanResidualUNet", **nn_metrics})
 
         if run_comparison:
             if not selected_methods:
@@ -445,9 +373,13 @@ def main():
                         "SSIM": np.nan,
                         "MSE": np.nan,
                         "MAE": np.nan,
+                        "Line L1": np.nan,
+                        "Weighted L1": np.nan,
+                        "Gain Line": np.nan,
+                        "Edge ref": np.nan,
                     }
                     if reference_pil is not None:
-                        row.update(compute_metrics(result_image, reference_pil))
+                        row.update(compute_metrics(result_image, reference_pil, baseline_pil))
                     metrics_rows.append(row)
 
         if metrics_rows:
@@ -456,7 +388,6 @@ def main():
         else:
             st.info("Чтобы получить PSNR/SSIM/MSE/MAE, загрузите эталонное HQ-изображение.")
 
-        # Кнопка скачивания
         buf = io.BytesIO()
         pred_pil.save(buf, format="PNG")
         buf.seek(0)
