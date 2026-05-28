@@ -10,11 +10,34 @@
 # In[ ]:
 
 
+#!/usr/bin/env python
+# coding: utf-8
+
+"""
+Full training script: Clean Residual U-Net v7 for FloorPlanCAD LQ -> HQ restoration.
+
+Based on successful overfit-test:
+    line_l1: ~0.0549 -> ~0.0135 on 3-image overfit
+
+Key ideas:
+- U-Net skip connections are kept.
+- Model predicts residual correction: pred = LQ + correction.
+- Explicit residual supervision: correction ≈ HQ - LQ.
+- Main validation metrics are line_l1 and gain_line, NOT PSNR.
+- ClearML dataset input and ClearML logging/checkpoints are included.
+
+Designed for Google Colab GPU.
+"""
+
 import os
 import random
 import json
-import numpy as np
+from pathlib import Path
+from getpass import getpass
+from typing import List, Tuple
+
 import cv2
+import numpy as np
 import matplotlib.pyplot as plt
 
 import torch
@@ -22,190 +45,158 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from pytorch_msssim import ssim
 from clearml import Task, Dataset as ClearMLDataset
-
-
-# =========================================================
-# CLEARML CREDENTIALS
-# =========================================================
-Task.set_credentials(
-    api_host="https://api.clear.ml",
-    web_host="https://app.clear.ml",
-    files_host="https://files.clear.ml",
-    key="ZCGVG8PSQJOOZNASXTHNO3MLHWXK6G",
-    secret="KQ46iRWMS_IRDUuB8BggNUZwj-3e_0CvEWmQXJU3pIWfanybc6smB4tfxxGKbQ1qSKI",
-)
-
-
-# =========================================================
-# CLEARML TASK
-# =========================================================
-old_task = Task.current_task()
-if old_task is not None:
-    old_task.close()
-
-task = Task.init(
-    project_name="Vosstanovlenie_tehnicheskih_sistem",
-    task_name="V24_Residual_UNet_FullDataset_MSE",
-    task_type=Task.TaskTypes.training,
-    reuse_last_task_id=False,
-)
-
-logger = task.get_logger()
 
 
 # =========================================================
 # CONFIG
 # =========================================================
-config = {
-    # Полный исходный датасет — лучший результат был именно на нём
-    "clearml_dataset_id": "3ea1e9f808034406bdf383ff1bbb32f4",
+CONFIG = {
+    "project_name": "Vosstanovlenie_tehnicheskih_sistem",
+    "task_name": "full_train_clean_resunet_v1.1",
+    "clearml_dataset_id": "aa90ed3c5ca14bec9f9828a8891a5a59",
 
     # Data
-    "image_size": 1000,
+    "image_size": 1024,
     "patch_size": 512,
     "test_split": 0.20,
     "subset_size": -1,
-
-    "patches_per_image": 4,
+    "train_patches_per_image": 4,
     "val_patches_per_image": 2,
-
-    "min_patch_content_ratio": 0.01,
+    "min_content_ratio": 0.01,
     "white_threshold": 245,
     "max_crop_attempts": 80,
     "pad_value": 255,
 
     # Dataloader
-    "batch_size": 4,
+    "batch_size": 2,
     "num_workers": 2,
 
-    # Model
-    "base_channels": 32,
-    "dropout_rate": 0.0,
-
-    # Обучаем мягкую поправку, потом подбираем scale
-    "train_residual_scale": 0.02,
+    # Model: successful overfit architecture
+    "base_channels": 64,
+    "dropout": 0.0,
+    "residual_scale": 1.0,
+    "extra_bottleneck_blocks": 2,
 
     # Training
-    "epochs": 80,
+    "epochs": 150,
     "lr": 1e-4,
-    "weight_decay": 1e-6,
-    "early_stopping_patience": 12,
+    "min_lr": 1e-6,
+    "weight_decay": 0.0,
+    "lr_patience": 12,
+    "early_stopping_patience": 35,
+    "grad_clip": 1.0,
 
-    # Scale sweep after training
-    "sweep_scales": [0.02, 0.05, 0.07, 0.10, 0.12],
+    # Loss weights from the successful overfit run
+    "w_base": 0.20,
+    "w_line": 0.55,
+    "w_residual": 0.50,
+    "w_edge": 0.00,
+    "line_mask_weight": 10.0,
 
-    # Logging / saving
+    # Logging/checkpoints
+    "save_dir": "full_train_clean_resunet_v7_outputs",
     "seed": 42,
-    "save_dir": "v24_residual_unet_full_dataset",
     "log_images_every": 1,
-    "save_epoch_every": 5,
+    "save_epoch_every": 10,
+    "num_visual_samples": 4,
 }
 
-config = task.connect(config)
 
-os.makedirs(config["save_dir"], exist_ok=True)
+# =========================================================
+# CLEARML CREDENTIALS
+# =========================================================
+def _safe_secret_to_str(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for k in ("value", "text", "secret", "key"):
+            if k in value and isinstance(value[k], str):
+                return value[k]
+    return str(value)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Device: {device}")
 
-if device == "cuda":
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    logger.report_text(f"GPU: {torch.cuda.get_device_name(0)}")
+def setup_clearml_credentials():
+    api_host = str(os.environ.get("CLEARML_API_HOST", "https://api.clear.ml"))
+    web_host = str(os.environ.get("CLEARML_WEB_HOST", "https://app.clear.ml"))
+    files_host = str(os.environ.get("CLEARML_FILES_HOST", "https://files.clear.ml"))
+
+    key = os.environ.get("ZCGVG8PSQJOOZNASXTHNO3MLHWXK6G")
+    secret = os.environ.get("KQ46iRWMS_IRDUuB8BggNUZwj-3e_0CvEWmQXJU3pIWfanybc6smB4tfxxGKbQ1qSKI")
+
+    if not isinstance(key, str) or not key:
+        key = _safe_secret_to_str(getpass("ClearML API access key: "))
+
+    if not isinstance(secret, str) or not secret:
+        secret = _safe_secret_to_str(getpass("ClearML API secret key: "))
+
+    Task.set_credentials(
+        api_host=api_host,
+        web_host=web_host,
+        files_host=files_host,
+        key=key,
+        secret=secret,
+    )
 
 
 # =========================================================
-# SEED
+# REPRODUCIBILITY
 # =========================================================
-random.seed(config["seed"])
-np.random.seed(config["seed"])
-torch.manual_seed(config["seed"])
-torch.cuda.manual_seed_all(config["seed"])
-torch.backends.cudnn.benchmark = True
-
-
-# =========================================================
-# DATASET DOWNLOAD
-# =========================================================
-dataset_artifact = ClearMLDataset.get(dataset_id=config["clearml_dataset_id"])
-local_path = dataset_artifact.get_local_copy()
-
-print(f"Dataset: {local_path}")
-logger.report_text(f"Dataset path: {local_path}")
-
-lq_dir = os.path.join(local_path, "LQ")
-hq_dir = os.path.join(local_path, "HQ")
-
-assert os.path.isdir(lq_dir), f"LQ folder not found: {lq_dir}"
-assert os.path.isdir(hq_dir), f"HQ folder not found: {hq_dir}"
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
 
 
 # =========================================================
-# HELPERS
+# IMAGE HELPERS
 # =========================================================
-def read_rgb(path):
+def read_rgb(path: str) -> np.ndarray:
     img = cv2.imread(path, cv2.IMREAD_COLOR)
-
     if img is None:
-        raise ValueError(f"Failed to read image: {path}")
-
+        raise ValueError(f"Could not read image: {path}")
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def resize_with_aspect_and_pad_rgb(img, target_size=1000, pad_value=255):
+def resize_with_aspect_and_pad_rgb(img: np.ndarray, target_size: int = 1024, pad_value: int = 255) -> np.ndarray:
     h, w = img.shape[:2]
-
     scale = min(target_size / w, target_size / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
 
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-
-    resized = cv2.resize(
-        img,
-        (new_w, new_h),
-        interpolation=cv2.INTER_AREA
-    )
-
-    canvas = np.full(
-        (target_size, target_size, 3),
-        pad_value,
-        dtype=np.uint8
-    )
-
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.full((target_size, target_size, 3), pad_value, dtype=np.uint8)
     top = (target_size - new_h) // 2
     left = (target_size - new_w) // 2
-
     canvas[top:top + new_h, left:left + new_w] = resized
-
     return canvas
 
 
-def calc_content_ratio_rgb(img, white_threshold=245):
+def to_tensor(img: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
+
+
+def tensor_to_numpy(t: torch.Tensor) -> np.ndarray:
+    arr = t.detach().float().cpu().permute(1, 2, 0).numpy()
+    return np.clip(arr, 0.0, 1.0)
+
+
+def content_ratio(img: np.ndarray, white_threshold: int = 245) -> float:
     gray = img.mean(axis=2)
     return float((gray < white_threshold).mean())
 
 
-def random_crop_pair(lq, hq, patch_size):
+def random_crop_pair(lq: np.ndarray, hq: np.ndarray, patch_size: int):
     h, w = hq.shape[:2]
-
-    if h < patch_size or w < patch_size:
-        lq = cv2.resize(lq, (patch_size, patch_size), interpolation=cv2.INTER_AREA)
-        hq = cv2.resize(hq, (patch_size, patch_size), interpolation=cv2.INTER_AREA)
-        return lq, hq
-
     y = random.randint(0, h - patch_size)
     x = random.randint(0, w - patch_size)
-
-    return (
-        lq[y:y + patch_size, x:x + patch_size],
-        hq[y:y + patch_size, x:x + patch_size],
-    )
+    return lq[y:y + patch_size, x:x + patch_size], hq[y:y + patch_size, x:x + patch_size]
 
 
-def fixed_crop_pair(lq, hq, patch_size, crop_id):
+def fixed_crop_pair(lq: np.ndarray, hq: np.ndarray, patch_size: int, crop_id: int):
     h, w = hq.shape[:2]
-
     positions = [
         (0, 0),
         (0, w - patch_size),
@@ -217,921 +208,596 @@ def fixed_crop_pair(lq, hq, patch_size, crop_id):
         ((h - patch_size) // 2, w - patch_size),
         (h - patch_size, (w - patch_size) // 2),
     ]
-
     y, x = positions[crop_id % len(positions)]
-
     y = max(0, min(y, h - patch_size))
     x = max(0, min(x, w - patch_size))
-
-    return (
-        lq[y:y + patch_size, x:x + patch_size],
-        hq[y:y + patch_size, x:x + patch_size],
-    )
+    return lq[y:y + patch_size, x:x + patch_size], hq[y:y + patch_size, x:x + patch_size]
 
 
-def augment_pair(lq, hq):
+def augment_pair(lq: np.ndarray, hq: np.ndarray):
     if random.random() < 0.5:
         lq = np.fliplr(lq).copy()
         hq = np.fliplr(hq).copy()
-
     if random.random() < 0.5:
         lq = np.flipud(lq).copy()
         hq = np.flipud(hq).copy()
-
     k = random.randint(0, 3)
-
     if k > 0:
         lq = np.rot90(lq, k).copy()
         hq = np.rot90(hq, k).copy()
-
     return lq, hq
-
-
-def to_tensor(img):
-    return torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
-
-
-def tensor_to_numpy(t):
-    arr = (
-        t.detach()
-        .float()
-        .cpu()
-        .permute(1, 2, 0)
-        .numpy()
-    )
-
-    return np.clip(arr, 0.0, 1.0).astype(np.float32)
-
-
-def calc_psnr(pred, target):
-    mse = F.mse_loss(pred, target)
-    mse = torch.clamp(mse, min=1e-10)
-    return 10.0 * torch.log10(1.0 / mse)
-
-
-def sharpen_tensor(lq):
-    outs = []
-
-    for i in range(lq.shape[0]):
-        img_np = tensor_to_numpy(lq[i])
-        blur = cv2.GaussianBlur(img_np, (0, 0), sigmaX=1.0)
-        sharp = cv2.addWeighted(img_np, 1.5, blur, -0.5, 0)
-        sharp = np.clip(sharp, 0.0, 1.0).astype(np.float32)
-        sharp_t = torch.from_numpy(sharp).permute(2, 0, 1)
-        outs.append(sharp_t)
-
-    return torch.stack(outs, dim=0).to(lq.device)
 
 
 # =========================================================
 # DATASET
 # =========================================================
-class ContentPatchDataset(Dataset):
+class FloorPlanPatchDataset(Dataset):
     def __init__(
         self,
-        lq_dir,
-        hq_dir,
-        indices,
-        image_size=1000,
-        patch_size=512,
-        patches_per_image=4,
-        augment=True,
-        train=True,
-        min_content_ratio=0.01,
-        white_threshold=245,
-        max_crop_attempts=80,
-        pad_value=255,
+        lq_dir: str,
+        hq_dir: str,
+        indices: List[int],
+        image_size: int,
+        patch_size: int,
+        patches_per_image: int,
+        train: bool,
+        min_content_ratio: float,
+        white_threshold: int,
+        max_crop_attempts: int,
+        pad_value: int,
+        augment: bool,
     ):
         self.lq_dir = lq_dir
         self.hq_dir = hq_dir
         self.indices = list(indices)
-
         self.image_size = image_size
         self.patch_size = patch_size
         self.patches_per_image = patches_per_image
-        self.augment = augment
         self.train = train
         self.min_content_ratio = min_content_ratio
         self.white_threshold = white_threshold
         self.max_crop_attempts = max_crop_attempts
         self.pad_value = pad_value
+        self.augment = augment
 
         exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+        lq_files = {Path(f).stem: f for f in os.listdir(lq_dir) if f.lower().endswith(exts)}
+        hq_files = {Path(f).stem: f for f in os.listdir(hq_dir) if f.lower().endswith(exts)}
+        common = sorted(set(lq_files.keys()) & set(hq_files.keys()))
+        self.files = [(lq_files[s], hq_files[s], s) for s in common]
 
-        lq_files = {
-            os.path.splitext(f)[0]: f
-            for f in os.listdir(lq_dir)
-            if f.lower().endswith(exts)
-        }
-
-        hq_files = {
-            os.path.splitext(f)[0]: f
-            for f in os.listdir(hq_dir)
-            if f.lower().endswith(exts)
-        }
-
-        common_stems = sorted(set(lq_files.keys()) & set(hq_files.keys()))
-        self.files = [(lq_files[s], hq_files[s]) for s in common_stems]
-
-        if len(self.files) == 0:
+        if not self.files:
             raise RuntimeError("No paired LQ/HQ images found")
 
         print(
-            f"ContentPatchDataset | images={len(self.indices)} | "
-            f"patches_per_image={self.patches_per_image} | "
-            f"train={self.train} | augment={self.augment}"
+            f"FloorPlanPatchDataset | images={len(self.indices)} | "
+            f"patches_per_image={patches_per_image} | train={train} | augment={augment}"
         )
 
     def __len__(self):
         return len(self.indices) * self.patches_per_image
 
-    def load_pair_by_real_index(self, real_idx):
-        lq_fname, hq_fname = self.files[real_idx]
+    def load_pair_by_real_index(self, real_idx: int):
+        lq_name, hq_name, stem = self.files[real_idx]
+        lq = read_rgb(os.path.join(self.lq_dir, lq_name))
+        hq = read_rgb(os.path.join(self.hq_dir, hq_name))
 
-        lq = read_rgb(os.path.join(self.lq_dir, lq_fname))
-        hq = read_rgb(os.path.join(self.hq_dir, hq_fname))
-
-        lq = resize_with_aspect_and_pad_rgb(
-            lq,
-            target_size=self.image_size,
-            pad_value=self.pad_value
-        )
-
-        hq = resize_with_aspect_and_pad_rgb(
-            hq,
-            target_size=self.image_size,
-            pad_value=self.pad_value
-        )
-
-        return lq, hq, lq_fname
+        lq = resize_with_aspect_and_pad_rgb(lq, self.image_size, self.pad_value)
+        hq = resize_with_aspect_and_pad_rgb(hq, self.image_size, self.pad_value)
+        return lq, hq, stem
 
     def get_content_patch_train(self, lq, hq):
-        best_lq_patch = None
-        best_hq_patch = None
+        best = None
         best_ratio = -1.0
-
         for _ in range(self.max_crop_attempts):
             lq_patch, hq_patch = random_crop_pair(lq, hq, self.patch_size)
-
-            ratio = calc_content_ratio_rgb(
-                hq_patch,
-                white_threshold=self.white_threshold
-            )
-
+            ratio = content_ratio(hq_patch, self.white_threshold)
             if ratio > best_ratio:
+                best = (lq_patch, hq_patch, ratio)
                 best_ratio = ratio
-                best_lq_patch = lq_patch
-                best_hq_patch = hq_patch
-
             if ratio >= self.min_content_ratio:
                 return lq_patch, hq_patch, ratio
-
-        return best_lq_patch, best_hq_patch, best_ratio
+        return best
 
     def get_content_patch_val(self, lq, hq, crop_id):
-        best_lq_patch = None
-        best_hq_patch = None
+        best = None
         best_ratio = -1.0
-
         for offset in range(9):
-            lq_patch, hq_patch = fixed_crop_pair(
-                lq,
-                hq,
-                self.patch_size,
-                crop_id + offset
-            )
-
-            ratio = calc_content_ratio_rgb(
-                hq_patch,
-                white_threshold=self.white_threshold
-            )
-
+            lq_patch, hq_patch = fixed_crop_pair(lq, hq, self.patch_size, crop_id + offset)
+            ratio = content_ratio(hq_patch, self.white_threshold)
             if ratio > best_ratio:
+                best = (lq_patch, hq_patch, ratio)
                 best_ratio = ratio
-                best_lq_patch = lq_patch
-                best_hq_patch = hq_patch
-
-        if best_ratio >= self.min_content_ratio:
-            return best_lq_patch, best_hq_patch, best_ratio
-
-        for _ in range(20):
-            lq_patch, hq_patch = random_crop_pair(lq, hq, self.patch_size)
-
-            ratio = calc_content_ratio_rgb(
-                hq_patch,
-                white_threshold=self.white_threshold
-            )
-
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_lq_patch = lq_patch
-                best_hq_patch = hq_patch
-
-        return best_lq_patch, best_hq_patch, best_ratio
+        return best
 
     def __getitem__(self, idx):
         image_pos = idx // self.patches_per_image
         crop_id = idx % self.patches_per_image
-
         real_idx = self.indices[image_pos]
-        lq, hq, fname = self.load_pair_by_real_index(real_idx)
+
+        lq, hq, stem = self.load_pair_by_real_index(real_idx)
 
         if self.train:
-            lq_patch, hq_patch, content_ratio = self.get_content_patch_train(lq, hq)
-
+            lq_patch, hq_patch, ratio = self.get_content_patch_train(lq, hq)
             if self.augment:
                 lq_patch, hq_patch = augment_pair(lq_patch, hq_patch)
-
         else:
-            lq_patch, hq_patch, content_ratio = self.get_content_patch_val(
-                lq,
-                hq,
-                crop_id
-            )
+            lq_patch, hq_patch, ratio = self.get_content_patch_val(lq, hq, crop_id)
 
-        return (
-            to_tensor(lq_patch),
-            to_tensor(hq_patch),
-            fname,
-            torch.tensor(content_ratio, dtype=torch.float32)
-        )
+        return to_tensor(lq_patch), to_tensor(hq_patch), stem, torch.tensor(ratio, dtype=torch.float32)
 
 
 # =========================================================
-# RESIDUAL U-NET MODEL
+# MODEL: CLEAN RESIDUAL U-NET
 # =========================================================
-def make_gn(ch):
-    if ch >= 128:
-        return nn.GroupNorm(8, ch)
-    return nn.GroupNorm(4, ch)
+def make_gn(ch: int):
+    groups = 8 if ch >= 64 else 4
+    return nn.GroupNorm(groups, ch)
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+class ResConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, dropout=0.0):
         super().__init__()
-
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            make_gn(out_ch),
-            nn.LeakyReLU(0.1, inplace=True),
-
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            make_gn(out_ch),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
+        self.proj = nn.Conv2d(in_ch, out_ch, 1, bias=False) if in_ch != out_ch else nn.Identity()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.gn1 = make_gn(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.gn2 = make_gn(out_ch)
+        self.drop = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.act = nn.SiLU(inplace=True)
 
     def forward(self, x):
-        return self.block(x)
+        identity = self.proj(x)
+        out = self.act(self.gn1(self.conv1(x)))
+        out = self.drop(out)
+        out = self.gn2(self.conv2(out))
+        return self.act(out + identity)
+
+
+class ConvStage(nn.Module):
+    def __init__(self, in_ch, out_ch, dropout=0.0, blocks=2):
+        super().__init__()
+        layers = [ResConvBlock(in_ch, out_ch, dropout)]
+        for _ in range(blocks - 1):
+            layers.append(ResConvBlock(out_ch, out_ch, dropout))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_ch, skip_ch, out_ch):
+    def __init__(self, in_ch, skip_ch, out_ch, dropout=0.0):
         super().__init__()
-
         self.up = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
             make_gn(out_ch),
-            nn.LeakyReLU(0.1, inplace=True),
+            nn.SiLU(inplace=True),
         )
-
-        self.conv = ConvBlock(out_ch + skip_ch, out_ch)
+        self.conv = ConvStage(out_ch + skip_ch, out_ch, dropout=dropout, blocks=2)
 
     def forward(self, x, skip):
         x = self.up(x)
-
         if x.shape[-2:] != skip.shape[-2:]:
-            x = F.interpolate(
-                x,
-                size=skip.shape[-2:],
-                mode="bilinear",
-                align_corners=False
-            )
-
-        x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return self.conv(torch.cat([x, skip], dim=1))
 
 
-class ResidualUNet(nn.Module):
-    """
-    Residual U-Net:
-    correction = UNet(input)
-    output = input + residual_scale * correction
-    """
-
-    def __init__(
-        self,
-        in_ch=3,
-        out_ch=3,
-        base=32,
-        dropout_rate=0.0,
-        residual_scale=0.02,
-    ):
+class CleanResidualUNet(nn.Module):
+    def __init__(self, in_ch=3, out_ch=3, base=64, dropout=0.0, residual_scale=1.0, extra_bottleneck_blocks=2):
         super().__init__()
-
         self.residual_scale = residual_scale
 
-        # Encoder
-        self.enc1 = ConvBlock(in_ch, base)
-        self.pool1 = nn.MaxPool2d(2)
+        self.enc1 = ConvStage(in_ch, base, dropout=dropout, blocks=2)
+        self.enc2 = ConvStage(base, base * 2, dropout=dropout, blocks=2)
+        self.enc3 = ConvStage(base * 2, base * 4, dropout=dropout, blocks=2)
+        self.enc4 = ConvStage(base * 4, base * 8, dropout=dropout, blocks=2)
+        self.pool = nn.MaxPool2d(2)
+        self.mid = ConvStage(base * 8, base * 8, dropout=dropout, blocks=2 + extra_bottleneck_blocks)
 
-        self.enc2 = ConvBlock(base, base * 2)
-        self.pool2 = nn.MaxPool2d(2)
+        self.up4 = UpBlock(base * 8, base * 8, base * 4, dropout)
+        self.up3 = UpBlock(base * 4, base * 4, base * 2, dropout)
+        self.up2 = UpBlock(base * 2, base * 2, base, dropout)
+        self.up1 = UpBlock(base, base, base, dropout)
 
-        self.enc3 = ConvBlock(base * 2, base * 4)
-        self.pool3 = nn.MaxPool2d(2)
-
-        self.enc4 = ConvBlock(base * 4, base * 8)
-        self.pool4 = nn.MaxPool2d(2)
-
-        # Bottleneck
-        self.bottleneck = nn.Sequential(
-            ConvBlock(base * 8, base * 8),
-            nn.Dropout2d(dropout_rate) if dropout_rate > 0 else nn.Identity()
-        )
-
-        # Decoder with skip connections
-        self.up4 = UpBlock(base * 8, base * 8, base * 4)
-        self.up3 = UpBlock(base * 4, base * 4, base * 2)
-        self.up2 = UpBlock(base * 2, base * 2, base)
-        self.up1 = UpBlock(base, base, base)
-
-        self.final = nn.Sequential(
-            nn.Conv2d(base, out_ch, 3, padding=1),
-            nn.Tanh(),
-        )
-
-        self.init_final_zero()
-
-    def init_final_zero(self):
-        final_conv = self.final[0]
-        nn.init.zeros_(final_conv.weight)
-
-        if final_conv.bias is not None:
-            nn.init.zeros_(final_conv.bias)
+        self.final = nn.Conv2d(base, out_ch, 3, padding=1)
+        nn.init.zeros_(self.final.weight)
+        nn.init.zeros_(self.final.bias)
 
     def forward(self, x):
-        original_size = x.shape[-2:]
-
         e1 = self.enc1(x)
-        p1 = self.pool1(e1)
-
-        e2 = self.enc2(p1)
-        p2 = self.pool2(e2)
-
-        e3 = self.enc3(p2)
-        p3 = self.pool3(e3)
-
-        e4 = self.enc4(p3)
-        p4 = self.pool4(e4)
-
-        b = self.bottleneck(p4)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+        b = self.mid(self.pool(e4))
 
         d4 = self.up4(b, e4)
         d3 = self.up3(d4, e3)
         d2 = self.up2(d3, e2)
         d1 = self.up1(d2, e1)
 
-        if d1.shape[-2:] != original_size:
-            d1 = F.interpolate(
-                d1,
-                size=original_size,
-                mode="bilinear",
-                align_corners=False
-            )
-
         correction = self.final(d1)
-
-        out = x + self.residual_scale * correction
-        out = torch.clamp(out, 0.0, 1.0)
-
-        return out
-
-
-def init_weights(m):
-    if isinstance(m, nn.Conv2d):
-        nn.init.kaiming_normal_(
-            m.weight,
-            a=0.1,
-            mode="fan_out",
-            nonlinearity="leaky_relu"
-        )
-
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
-
-    elif isinstance(m, nn.GroupNorm):
-        if m.weight is not None:
-            nn.init.ones_(m.weight)
-
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
+        pred = x + self.residual_scale * correction
+        return pred, correction
 
 
 # =========================================================
-# DATA SPLIT
+# LOSSES AND METRICS
 # =========================================================
-exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
-
-lq_files = {
-    os.path.splitext(f)[0]: f
-    for f in os.listdir(lq_dir)
-    if f.lower().endswith(exts)
-}
-
-hq_files = {
-    os.path.splitext(f)[0]: f
-    for f in os.listdir(hq_dir)
-    if f.lower().endswith(exts)
-}
-
-common_stems = sorted(set(lq_files.keys()) & set(hq_files.keys()))
-dataset_len = len(common_stems)
-
-if dataset_len == 0:
-    raise RuntimeError("No paired images found")
-
-print(f"Total paired images: {dataset_len}")
-
-if config["subset_size"] is None or config["subset_size"] <= 0 or config["subset_size"] > dataset_len:
-    selected_indices = list(range(dataset_len))
-    print(f"Using full dataset: {dataset_len} images")
-else:
-    selected_indices = random.sample(range(dataset_len), config["subset_size"])
-    print(f"Using subset: {len(selected_indices)} / {dataset_len}")
-
-total = len(selected_indices)
-test_size = max(1, int(total * config["test_split"]))
-train_size = total - test_size
-
-split_gen = torch.Generator().manual_seed(config["seed"])
-
-train_selected, test_selected = torch.utils.data.random_split(
-    selected_indices,
-    [train_size, test_size],
-    generator=split_gen
-)
-
-train_indices = list(train_selected)
-test_indices = list(test_selected)
-
-train_dataset = ContentPatchDataset(
-    lq_dir=lq_dir,
-    hq_dir=hq_dir,
-    indices=train_indices,
-    image_size=config["image_size"],
-    patch_size=config["patch_size"],
-    patches_per_image=config["patches_per_image"],
-    augment=True,
-    train=True,
-    min_content_ratio=config["min_patch_content_ratio"],
-    white_threshold=config["white_threshold"],
-    max_crop_attempts=config["max_crop_attempts"],
-    pad_value=config["pad_value"],
-)
-
-test_dataset = ContentPatchDataset(
-    lq_dir=lq_dir,
-    hq_dir=hq_dir,
-    indices=test_indices,
-    image_size=config["image_size"],
-    patch_size=config["patch_size"],
-    patches_per_image=config["val_patches_per_image"],
-    augment=False,
-    train=False,
-    min_content_ratio=config["min_patch_content_ratio"],
-    white_threshold=config["white_threshold"],
-    max_crop_attempts=config["max_crop_attempts"],
-    pad_value=config["pad_value"],
-)
-
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=config["batch_size"],
-    shuffle=True,
-    num_workers=config["num_workers"],
-    pin_memory=True,
-    drop_last=False,
-)
-
-test_loader = DataLoader(
-    test_dataset,
-    batch_size=1,
-    shuffle=False,
-    num_workers=config["num_workers"],
-    pin_memory=True,
-    drop_last=False,
-)
-
-print(f"Train images: {train_size} | Test images: {test_size}")
-print(f"Train patches: {len(train_dataset)} | Test patches: {len(test_dataset)}")
-
-logger.report_text(f"Train images: {train_size} | Test images: {test_size}")
-logger.report_text(f"Train patches: {len(train_dataset)} | Test patches: {len(test_dataset)}")
+def charbonnier(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    return torch.sqrt(x * x + eps * eps)
 
 
-# =========================================================
-# MODEL / OPTIMIZER
-# =========================================================
-model = ResidualUNet(
-    in_ch=3,
-    out_ch=3,
-    base=config["base_channels"],
-    dropout_rate=config["dropout_rate"],
-    residual_scale=config["train_residual_scale"],
-)
-
-model.apply(init_weights)
-model.init_final_zero()
-model = model.to(device)
-
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Parameters: {total_params:,}")
-logger.report_text(f"Parameters: {total_params:,}")
-
-optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=config["lr"],
-    weight_decay=config["weight_decay"],
-)
-
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer,
-    mode="max",
-    factor=0.5,
-    patience=4,
-)
-
-scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
-criterion = nn.MSELoss()
+def line_mask(target: torch.Tensor, white_threshold: float = 245 / 255.0) -> torch.Tensor:
+    gray = target.mean(dim=1, keepdim=True)
+    mask = (gray < white_threshold).float()
+    mask = F.max_pool2d(mask, kernel_size=5, stride=1, padding=2)
+    return mask
 
 
-# =========================================================
-# PATHS
-# =========================================================
-epochs_ckpt_dir = os.path.join(config["save_dir"], "epoch_checkpoints")
-os.makedirs(epochs_ckpt_dir, exist_ok=True)
+def sobel_edges(x: torch.Tensor) -> torch.Tensor:
+    gray = x.mean(dim=1, keepdim=True)
+    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
+    ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
+    gx = F.conv2d(gray, kx, padding=1)
+    gy = F.conv2d(gray, ky, padding=1)
+    return torch.sqrt(gx * gx + gy * gy + 1e-6)
 
-best_model_path = os.path.join(config["save_dir"], "best_model.pth")
-last_model_path = os.path.join(config["save_dir"], "last_model.pth")
+
+def calc_line_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    mask = line_mask(target)
+    return (torch.abs(pred - target) * mask).sum() / (mask.sum() * pred.shape[1] + 1e-6)
 
 
-def save_checkpoint(path, epoch, best_psnr):
-    checkpoint = {
-        "epoch": epoch + 1,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict(),
-        "scaler_state": scaler.state_dict(),
-        "best_psnr": best_psnr,
-        "config": dict(config),
-        "architecture": "ResidualUNet",
+def weighted_l1_metric(pred: torch.Tensor, target: torch.Tensor, mask_weight: float = 10.0) -> torch.Tensor:
+    mask = line_mask(target)
+    return (torch.abs(pred - target) * (1.0 + mask_weight * mask)).mean()
+
+
+def restoration_loss(pred, hq, lq, correction, cfg):
+    mask = line_mask(hq)
+    diff = pred - hq
+    true_residual = hq - lq
+
+    base = charbonnier(diff).mean()
+    line = (charbonnier(diff) * (1.0 + cfg["line_mask_weight"] * mask)).mean()
+    residual = (charbonnier(correction - true_residual) * (1.0 + cfg["line_mask_weight"] * mask)).mean()
+    edge = F.l1_loss(sobel_edges(pred), sobel_edges(hq))
+
+    loss = cfg["w_base"] * base + cfg["w_line"] * line + cfg["w_residual"] * residual + cfg["w_edge"] * edge
+    return loss, {
+        "l1": F.l1_loss(pred, hq).detach(),
+        "weighted_l1": weighted_l1_metric(pred, hq, cfg["line_mask_weight"]).detach(),
+        "residual": residual.detach(),
+        "edge_ref": edge.detach(),
     }
 
-    torch.save(checkpoint, path)
 
+# =========================================================
+# LOGGING / CHECKPOINTS
+# =========================================================
+def log_visual_grid(logger, samples, epoch, save_dir, title="Validation samples"):
+    rows = len(samples)
+    fig, axes = plt.subplots(rows, 5, figsize=(24, 5 * rows))
+    if rows == 1:
+        axes = np.expand_dims(axes, axis=0)
 
-def upload_artifact_safe(name, path):
-    task.upload_artifact(name, path)
-    print(f"Uploaded artifact: {name}")
+    for r, (lq, pred, hq, correction, name) in enumerate(samples):
+        axes[r, 0].imshow(tensor_to_numpy(lq))
+        axes[r, 0].set_title(f"LQ | {name}")
+        axes[r, 0].axis("off")
 
+        axes[r, 1].imshow(tensor_to_numpy(pred))
+        axes[r, 1].set_title("Prediction")
+        axes[r, 1].axis("off")
 
-def log_comparison(lq, pred, hq, iteration, series, title):
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        axes[r, 2].imshow(tensor_to_numpy(hq))
+        axes[r, 2].set_title("HQ")
+        axes[r, 2].axis("off")
 
-    axes[0].imshow(tensor_to_numpy(lq))
-    axes[0].set_title("LQ Input")
-    axes[0].axis("off")
+        diff = torch.abs(pred - hq).mean(dim=0).detach().float().cpu().numpy()
+        axes[r, 3].imshow(diff, cmap="gray")
+        axes[r, 3].set_title("Abs diff")
+        axes[r, 3].axis("off")
 
-    axes[1].imshow(tensor_to_numpy(pred))
-    axes[1].set_title("Prediction")
-    axes[1].axis("off")
-
-    axes[2].imshow(tensor_to_numpy(hq))
-    axes[2].set_title("HQ Target")
-    axes[2].axis("off")
+        corr_np = correction.detach().float().cpu().permute(1, 2, 0).numpy()
+        corr_vis = np.clip((corr_np * 6.0) + 0.5, 0, 1)
+        axes[r, 4].imshow(corr_vis)
+        axes[r, 4].set_title("Correction x6")
+        axes[r, 4].axis("off")
 
     plt.tight_layout()
+    logger.report_matplotlib_figure(title=title, series="LQ / Pred / HQ / Diff / Correction", figure=fig, iteration=epoch)
 
-    logger.report_matplotlib_figure(
-        title=title,
-        series=series,
-        figure=fig,
-        iteration=iteration
-    )
-
-    vis_dir = os.path.join(config["save_dir"], "visual_examples")
-    os.makedirs(vis_dir, exist_ok=True)
-
-    save_path = os.path.join(vis_dir, f"epoch_{iteration + 1:03d}.png")
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-
-    task.upload_artifact(
-        name=f"visual_epoch_{iteration + 1:03d}",
-        artifact_object=save_path
-    )
-
+    path = os.path.join(save_dir, f"val_visual_epoch_{epoch:04d}.png")
+    fig.savefig(path, dpi=130, bbox_inches="tight")
     plt.close(fig)
+    return path
 
 
-# =========================================================
-# TRAINING LOOP
-# =========================================================
-best_psnr = 0.0
-epochs_no_improve = 0
-last_completed_epoch = 0
-
-for epoch in range(config["epochs"]):
-    model.train()
-
-    train_mse_sum = 0.0
-    train_content_sum = 0.0
-
-    for lq, hq, _, content_ratio in train_loader:
-        lq = lq.to(device, non_blocking=True)
-        hq = hq.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-
-        with torch.amp.autocast("cuda", enabled=(device == "cuda")):
-            pred = model(lq)
-            loss = criterion(pred, hq)
-
-        scaler.scale(loss).backward()
-
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        scaler.step(optimizer)
-        scaler.update()
-
-        train_mse_sum += loss.item()
-        train_content_sum += content_ratio.float().mean().item()
-
-    n_train = len(train_loader)
-
-    train_mse = train_mse_sum / n_train
-    train_content = train_content_sum / n_train
-
-    logger.report_scalar("Loss", "train_MSE", train_mse, epoch)
-    logger.report_scalar("Content", "train_content_ratio", train_content, epoch)
-
-    # =====================================================
-    # VALIDATION
-    # =====================================================
-    model.eval()
-
-    test_psnr_sum = 0.0
-    test_lq_psnr_sum = 0.0
-    test_sharp_psnr_sum = 0.0
-
-    test_mse_sum = 0.0
-    test_lq_mse_sum = 0.0
-    test_sharp_mse_sum = 0.0
-
-    test_ssim_sum = 0.0
-    test_lq_ssim_sum = 0.0
-    test_sharp_ssim_sum = 0.0
-
-    test_sample = None
-
-    with torch.no_grad():
-        for i, (lq, hq, _, _) in enumerate(test_loader):
-            lq = lq.to(device, non_blocking=True)
-            hq = hq.to(device, non_blocking=True)
-
-            with torch.amp.autocast("cuda", enabled=(device == "cuda")):
-                pred = model(lq)
-
-            pred_f = pred.float()
-            hq_f = hq.float()
-            lq_f = lq.float()
-            sharp_f = sharpen_tensor(lq_f)
-
-            test_mse_sum += F.mse_loss(pred_f, hq_f).item()
-            test_lq_mse_sum += F.mse_loss(lq_f, hq_f).item()
-            test_sharp_mse_sum += F.mse_loss(sharp_f, hq_f).item()
-
-            test_psnr_sum += calc_psnr(pred_f, hq_f).item()
-            test_lq_psnr_sum += calc_psnr(lq_f, hq_f).item()
-            test_sharp_psnr_sum += calc_psnr(sharp_f, hq_f).item()
-
-            test_ssim_sum += ssim(pred_f, hq_f, data_range=1.0, size_average=True).item()
-            test_lq_ssim_sum += ssim(lq_f, hq_f, data_range=1.0, size_average=True).item()
-            test_sharp_ssim_sum += ssim(sharp_f, hq_f, data_range=1.0, size_average=True).item()
-
-            if i == 0:
-                test_sample = (
-                    lq[0].detach().float().cpu(),
-                    pred[0].detach().float().cpu(),
-                    hq[0].detach().float().cpu(),
-                )
-
-    n_test = len(test_loader)
-
-    test_psnr = test_psnr_sum / n_test
-    test_lq_psnr = test_lq_psnr_sum / n_test
-    test_sharp_psnr = test_sharp_psnr_sum / n_test
-
-    test_mse = test_mse_sum / n_test
-    test_lq_mse = test_lq_mse_sum / n_test
-    test_sharp_mse = test_sharp_mse_sum / n_test
-
-    test_ssim = test_ssim_sum / n_test
-    test_lq_ssim = test_lq_ssim_sum / n_test
-    test_sharp_ssim = test_sharp_ssim_sum / n_test
-
-    gain_lq = test_psnr - test_lq_psnr
-    gain_sharp = test_psnr - test_sharp_psnr
-
-    scheduler.step(test_psnr)
-    current_lr = optimizer.param_groups[0]["lr"]
-
-    logger.report_scalar("PSNR", "model", test_psnr, epoch)
-    logger.report_scalar("PSNR", "LQ_baseline", test_lq_psnr, epoch)
-    logger.report_scalar("PSNR", "sharpen_baseline", test_sharp_psnr, epoch)
-    logger.report_scalar("PSNR", "gain_over_LQ", gain_lq, epoch)
-    logger.report_scalar("PSNR", "gain_over_sharpen", gain_sharp, epoch)
-
-    logger.report_scalar("MSE", "model", test_mse, epoch)
-    logger.report_scalar("MSE", "LQ_baseline", test_lq_mse, epoch)
-    logger.report_scalar("MSE", "sharpen_baseline", test_sharp_mse, epoch)
-
-    logger.report_scalar("SSIM", "model", test_ssim, epoch)
-    logger.report_scalar("SSIM", "LQ_baseline", test_lq_ssim, epoch)
-    logger.report_scalar("SSIM", "sharpen_baseline", test_sharp_ssim, epoch)
-    logger.report_scalar("LR", "learning_rate", current_lr, epoch)
-
-    if test_sample is not None and ((epoch + 1) % config["log_images_every"] == 0):
-        log_comparison(
-            *test_sample,
-            iteration=epoch,
-            series="residual_unet_test_examples",
-            title=(
-                f"Epoch {epoch + 1} | "
-                f"Model {test_psnr:.3f} | "
-                f"LQ {test_lq_psnr:.3f} | "
-                f"Sharp {test_sharp_psnr:.3f} | "
-                f"Gain {gain_lq:+.3f}"
-            )
-        )
-
-    print(
-        f"Epoch {epoch + 1:03d}/{config['epochs']} | "
-        f"LR: {current_lr:.2e} | "
-        f"Train MSE: {train_mse:.7f} | "
-        f"Test MSE: {test_mse:.7f} | "
-        f"LQ PSNR: {test_lq_psnr:.3f} | "
-        f"Sharp PSNR: {test_sharp_psnr:.3f} | "
-        f"Model PSNR: {test_psnr:.3f} | "
-        f"Gain LQ: {gain_lq:+.4f} | "
-        f"Gain Sharp: {gain_sharp:+.4f} | "
-        f"SSIM: {test_ssim:.4f}"
+def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_metric, cfg):
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state": scaler.state_dict(),
+            "epoch": epoch,
+            "best_metric": best_metric,
+            "config": dict(cfg),
+            "architecture": "CleanResidualUNet",
+        },
+        path,
     )
 
-    last_completed_epoch = epoch + 1
-
-    save_checkpoint(last_model_path, epoch, best_psnr)
-
-    if (epoch + 1) % config["save_epoch_every"] == 0:
-        upload_artifact_safe("last_model", last_model_path)
-
-        epoch_ckpt_path = os.path.join(
-            epochs_ckpt_dir,
-            f"epoch_{epoch + 1:03d}.pth"
-        )
-
-        save_checkpoint(epoch_ckpt_path, epoch, best_psnr)
-        upload_artifact_safe(f"epoch_{epoch + 1:03d}", epoch_ckpt_path)
-
-    if test_psnr > best_psnr:
-        best_psnr = test_psnr
-        epochs_no_improve = 0
-
-        save_checkpoint(best_model_path, epoch, best_psnr)
-        upload_artifact_safe("best_model", best_model_path)
-
-        print(f"  >> New best PSNR: {best_psnr:.3f}")
-
-    else:
-        epochs_no_improve += 1
-
-        print(
-            f"  No improvement: {epochs_no_improve}/"
-            f"{config['early_stopping_patience']}"
-        )
-
-        if epochs_no_improve >= config["early_stopping_patience"]:
-            print(f"Early stopping at epoch {epoch + 1}")
-            break
-
 
 # =========================================================
-# FINAL SCALE SWEEP
+# TRAIN / VALIDATE
 # =========================================================
-print("=" * 80)
-print("FINAL SCALE SWEEP")
-print("=" * 80)
-
-checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
-model.load_state_dict(checkpoint["model_state"])
-model.eval()
-
-sweep_results = {}
-
-for scale in config["sweep_scales"]:
-    model.residual_scale = float(scale)
-
-    psnr_sum = 0.0
-    lq_psnr_sum = 0.0
-    sharp_psnr_sum = 0.0
-
-    ssim_sum = 0.0
-    lq_ssim_sum = 0.0
-    sharp_ssim_sum = 0.0
-
-    with torch.no_grad():
-        for lq, hq, _, _ in test_loader:
-            lq = lq.to(device, non_blocking=True)
-            hq = hq.to(device, non_blocking=True)
-
-            pred = model(lq).float()
-
-            hq_f = hq.float()
-            lq_f = lq.float()
-            sharp_f = sharpen_tensor(lq_f)
-
-            psnr_sum += calc_psnr(pred, hq_f).item()
-            lq_psnr_sum += calc_psnr(lq_f, hq_f).item()
-            sharp_psnr_sum += calc_psnr(sharp_f, hq_f).item()
-
-            ssim_sum += ssim(pred, hq_f, data_range=1.0, size_average=True).item()
-            lq_ssim_sum += ssim(lq_f, hq_f, data_range=1.0, size_average=True).item()
-            sharp_ssim_sum += ssim(sharp_f, hq_f, data_range=1.0, size_average=True).item()
-
-    n = len(test_loader)
-
-    result = {
-        "scale": float(scale),
-        "psnr": psnr_sum / n,
-        "lq_psnr": lq_psnr_sum / n,
-        "sharp_psnr": sharp_psnr_sum / n,
-        "ssim": ssim_sum / n,
-        "lq_ssim": lq_ssim_sum / n,
-        "sharp_ssim": sharp_ssim_sum / n,
+def run_epoch(model, loader, optimizer, scaler, cfg, device, train: bool):
+    model.train(train)
+    sums = {
+        "loss": 0.0,
+        "l1": 0.0,
+        "weighted_l1": 0.0,
+        "residual": 0.0,
+        "edge_ref": 0.0,
+        "line_l1": 0.0,
+        "lq_line": 0.0,
+        "gain_line": 0.0,
+        "gain_weighted": 0.0,
+        "content": 0.0,
     }
 
-    result["gain_lq"] = result["psnr"] - result["lq_psnr"]
-    result["gain_sharp"] = result["psnr"] - result["sharp_psnr"]
+    visual_samples = []
 
-    sweep_results[str(scale)] = result
+    context = torch.enable_grad() if train else torch.no_grad()
+    with context:
+        for lq, hq, names, content in loader:
+            lq = lq.to(device, non_blocking=True)
+            hq = hq.to(device, non_blocking=True)
 
-    logger.report_scalar("FinalScaleSweep/PSNR", f"scale_{scale}", result["psnr"], 0)
-    logger.report_scalar("FinalScaleSweep/Gain_LQ", f"scale_{scale}", result["gain_lq"], 0)
-    logger.report_scalar("FinalScaleSweep/Gain_Sharp", f"scale_{scale}", result["gain_sharp"], 0)
-    logger.report_scalar("FinalScaleSweep/SSIM", f"scale_{scale}", result["ssim"], 0)
+            if train:
+                optimizer.zero_grad(set_to_none=True)
 
-    print(
-        f"scale={scale:.3f} | "
-        f"PSNR={result['psnr']:.4f} | "
-        f"Gain LQ={result['gain_lq']:+.4f} | "
-        f"Gain Sharp={result['gain_sharp']:+.4f} | "
-        f"SSIM={result['ssim']:.4f}"
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+                pred, correction = model(lq)
+                loss, parts = restoration_loss(pred, hq, lq, correction, cfg)
+
+            if train:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+                scaler.step(optimizer)
+                scaler.update()
+
+            with torch.no_grad():
+                model_line = calc_line_l1(pred.float(), hq.float()).item()
+                lq_line = calc_line_l1(lq.float(), hq.float()).item()
+                model_weighted = weighted_l1_metric(pred.float(), hq.float(), cfg["line_mask_weight"]).item()
+                lq_weighted = weighted_l1_metric(lq.float(), hq.float(), cfg["line_mask_weight"]).item()
+
+                sums["loss"] += loss.item()
+                sums["l1"] += parts["l1"].item()
+                sums["weighted_l1"] += parts["weighted_l1"].item()
+                sums["residual"] += parts["residual"].item()
+                sums["edge_ref"] += parts["edge_ref"].item()
+                sums["line_l1"] += model_line
+                sums["lq_line"] += lq_line
+                sums["gain_line"] += (lq_line - model_line)
+                sums["gain_weighted"] += (lq_weighted - model_weighted)
+                sums["content"] += content.float().mean().item()
+
+                if not train and len(visual_samples) < cfg["num_visual_samples"]:
+                    visual_samples.append((
+                        lq[0].detach().float().cpu(),
+                        pred[0].detach().float().cpu(),
+                        hq[0].detach().float().cpu(),
+                        correction[0].detach().float().cpu(),
+                        str(names[0]),
+                    ))
+
+    n = len(loader)
+    avg = {k: v / max(1, n) for k, v in sums.items()}
+    return avg, visual_samples
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    setup_clearml_credentials()
+    cfg = dict(CONFIG)
+    seed_everything(cfg["seed"])
+    os.makedirs(cfg["save_dir"], exist_ok=True)
+    os.makedirs(os.path.join(cfg["save_dir"], "checkpoints"), exist_ok=True)
+
+    task = Task.init(
+        project_name=cfg["project_name"],
+        task_name=cfg["task_name"],
+        task_type=Task.TaskTypes.training,
+        reuse_last_task_id=False,
+    )
+    task.connect(cfg)
+    logger = task.get_logger()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+    logger.report_text(f"Device: {device}")
+
+    dataset_obj = ClearMLDataset.get(dataset_id=cfg["clearml_dataset_id"])
+    local_path = dataset_obj.get_local_copy()
+    lq_dir = os.path.join(local_path, "LQ")
+    hq_dir = os.path.join(local_path, "HQ")
+    assert os.path.isdir(lq_dir), f"LQ folder not found: {lq_dir}"
+    assert os.path.isdir(hq_dir), f"HQ folder not found: {hq_dir}"
+
+    exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+    lq_stems = {Path(f).stem for f in os.listdir(lq_dir) if f.lower().endswith(exts)}
+    hq_stems = {Path(f).stem for f in os.listdir(hq_dir) if f.lower().endswith(exts)}
+    dataset_len = len(sorted(lq_stems & hq_stems))
+    if dataset_len == 0:
+        raise RuntimeError("No paired images found")
+
+    if cfg["subset_size"] is None or cfg["subset_size"] <= 0 or cfg["subset_size"] > dataset_len:
+        selected_indices = list(range(dataset_len))
+    else:
+        selected_indices = random.sample(range(dataset_len), cfg["subset_size"])
+
+    total = len(selected_indices)
+    test_size = max(1, int(total * cfg["test_split"]))
+    train_size = total - test_size
+    split_gen = torch.Generator().manual_seed(cfg["seed"])
+    train_selected, val_selected = torch.utils.data.random_split(selected_indices, [train_size, test_size], generator=split_gen)
+    train_indices = list(train_selected)
+    val_indices = list(val_selected)
+
+    train_dataset = FloorPlanPatchDataset(
+        lq_dir=lq_dir,
+        hq_dir=hq_dir,
+        indices=train_indices,
+        image_size=cfg["image_size"],
+        patch_size=cfg["patch_size"],
+        patches_per_image=cfg["train_patches_per_image"],
+        train=True,
+        min_content_ratio=cfg["min_content_ratio"],
+        white_threshold=cfg["white_threshold"],
+        max_crop_attempts=cfg["max_crop_attempts"],
+        pad_value=cfg["pad_value"],
+        augment=True,
     )
 
+    val_dataset = FloorPlanPatchDataset(
+        lq_dir=lq_dir,
+        hq_dir=hq_dir,
+        indices=val_indices,
+        image_size=cfg["image_size"],
+        patch_size=cfg["patch_size"],
+        patches_per_image=cfg["val_patches_per_image"],
+        train=False,
+        min_content_ratio=cfg["min_content_ratio"],
+        white_threshold=cfg["white_threshold"],
+        max_crop_attempts=cfg["max_crop_attempts"],
+        pad_value=cfg["pad_value"],
+        augment=False,
+    )
 
-best_sweep = max(sweep_results.values(), key=lambda x: x["psnr"])
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg["batch_size"],
+        shuffle=True,
+        num_workers=cfg["num_workers"],
+        pin_memory=True,
+        drop_last=False,
+    )
 
-summary = {
-    "architecture": "Residual U-Net",
-    "dataset_id": config["clearml_dataset_id"],
-    "best_train_psnr_at_scale_0.02": best_psnr,
-    "last_epoch_completed": last_completed_epoch,
-    "sweep_results": sweep_results,
-    "best_sweep": best_sweep,
-    "config": dict(config),
-}
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=cfg["num_workers"],
+        pin_memory=True,
+        drop_last=False,
+    )
 
-summary_path = os.path.join(config["save_dir"], "summary.json")
+    print(f"Total paired images: {dataset_len}")
+    print(f"Train images: {train_size} | Val images: {test_size}")
+    print(f"Train patches: {len(train_dataset)} | Val patches: {len(val_dataset)}")
+    logger.report_text(
+        f"Total paired images: {dataset_len}\n"
+        f"Train images: {train_size} | Val images: {test_size}\n"
+        f"Train patches: {len(train_dataset)} | Val patches: {len(val_dataset)}"
+    )
 
-with open(summary_path, "w", encoding="utf-8") as f:
-    json.dump(summary, f, ensure_ascii=False, indent=2)
+    model = CleanResidualUNet(
+        base=cfg["base_channels"],
+        dropout=cfg["dropout"],
+        residual_scale=cfg["residual_scale"],
+        extra_bottleneck_blocks=cfg["extra_bottleneck_blocks"],
+    ).to(device)
 
-task.upload_artifact("summary", summary_path)
-task.upload_artifact("outputs_folder", config["save_dir"])
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {total_params:,}")
+    logger.report_text(f"Parameters: {total_params:,}")
 
-print()
-print("=" * 80)
-print("DONE")
-print(f"Best training PSNR at scale 0.02: {best_psnr:.4f}")
-print(
-    f"Best sweep: scale={best_sweep['scale']} | "
-    f"PSNR={best_sweep['psnr']:.4f} | "
-    f"Gain LQ={best_sweep['gain_lq']:+.4f} | "
-    f"Gain Sharp={best_sweep['gain_sharp']:+.4f} | "
-    f"SSIM={best_sweep['ssim']:.4f}"
-)
-print("=" * 80)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=cfg["lr_patience"],
+        min_lr=cfg["min_lr"],
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-task.close()
+    best_val_line = float("inf")
+    epochs_no_improve = 0
+    best_path = os.path.join(cfg["save_dir"], "checkpoints", "best_model.pth")
+    last_path = os.path.join(cfg["save_dir"], "checkpoints", "last_model.pth")
+
+    for epoch in range(1, cfg["epochs"] + 1):
+        train_avg, _ = run_epoch(model, train_loader, optimizer, scaler, cfg, device, train=True)
+        val_avg, visual_samples = run_epoch(model, val_loader, optimizer, scaler, cfg, device, train=False)
+
+        scheduler.step(val_avg["line_l1"])
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        for key, value in train_avg.items():
+            logger.report_scalar("Train", key, value, epoch)
+        for key, value in val_avg.items():
+            logger.report_scalar("Val", key, value, epoch)
+        logger.report_scalar("LR", "current", current_lr, epoch)
+
+        if epoch % cfg["log_images_every"] == 0:
+            img_path = log_visual_grid(logger, visual_samples, epoch, cfg["save_dir"])
+            if epoch % cfg["save_epoch_every"] == 0:
+                task.upload_artifact(f"val_visual_epoch_{epoch:04d}", img_path)
+
+        save_checkpoint(last_path, model, optimizer, scheduler, scaler, epoch, best_val_line, cfg)
+
+        is_best = val_avg["line_l1"] < best_val_line
+        if is_best:
+            best_val_line = val_avg["line_l1"]
+            epochs_no_improve = 0
+            save_checkpoint(best_path, model, optimizer, scheduler, scaler, epoch, best_val_line, cfg)
+            task.upload_artifact("best_model", best_path)
+        else:
+            epochs_no_improve += 1
+
+        if epoch % cfg["save_epoch_every"] == 0:
+            epoch_path = os.path.join(cfg["save_dir"], "checkpoints", f"epoch_{epoch:04d}.pth")
+            save_checkpoint(epoch_path, model, optimizer, scheduler, scaler, epoch, best_val_line, cfg)
+            task.upload_artifact(f"epoch_{epoch:04d}", epoch_path)
+            task.upload_artifact("last_model", last_path)
+
+        print(
+            f"Epoch {epoch:04d}/{cfg['epochs']} | "
+            f"LR={current_lr:.2e} | "
+            f"Train line={train_avg['line_l1']:.6f} gain={train_avg['gain_line']:+.6f} loss={train_avg['loss']:.6f} | "
+            f"Val line={val_avg['line_l1']:.6f} lq={val_avg['lq_line']:.6f} gain={val_avg['gain_line']:+.6f} "
+            f"edge={val_avg['edge_ref']:.6f} loss={val_avg['loss']:.6f} | "
+            f"Best val line={best_val_line:.6f} | "
+            f"NoImprove={epochs_no_improve}/{cfg['early_stopping_patience']}"
+        )
+
+        if epochs_no_improve >= cfg["early_stopping_patience"]:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+    summary = {
+        "best_val_line_l1": best_val_line,
+        "config": dict(cfg),
+    }
+    summary_path = os.path.join(cfg["save_dir"], "summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    task.upload_artifact("summary", summary_path)
+    task.upload_artifact("outputs_folder", cfg["save_dir"])
+    task.close()
+
+
+if __name__ == "__main__":
+    main()
 
